@@ -1,89 +1,94 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
 import cors from "cors";
-import fetch from "node-fetch";
-import WebSocket, { WebSocketServer } from "ws";
+import WebSocketClient from "ws"; // для Coinbase
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// === Исторические данные (OHLC) ===
-// Coinbase поддерживает granularity: 60, 300, 900, 3600, 21600, 86400
-app.get("/history", async (req, res) => {
-    try {
-        const granularity = 60; // 1 минута
-        const now = Math.floor(Date.now() / 1000);
-        const start = now - 60 * 300; // последние 300 минут
-
-        const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=${granularity}&start=${start}&end=${now}`;
-
-        const r = await fetch(url);
-        const data = await r.json();
-
-        // Coinbase отдаёт свечи в формате:
-        // [ time, low, high, open, close, volume ]
-        const candles = data.reverse().map(c => ({
-            time: c[0],
-            open: c[3],
-            high: c[2],
-            low: c[1],
-            close: c[4]
-        }));
-
-        res.json({ ok: true, candles });
-
-    } catch (err) {
-        console.error(err);
-        res.json({ ok: false, error: err.message });
-    }
-});
-
-// === Real-time WebSocket Coinbase feed → our WS server ===
-const server = app.listen(8081, () => {
-    console.log("Price server running on 8081");
-});
-
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-let clients = new Set();
+// ========== FRONTEND WS SERVER ==========
+wss.on("connection", (ws) => {
+    console.log("🎉 Клиент подключился к WS");
 
-// Подключение клиентов
-wss.on("connection", ws => {
-    clients.add(ws);
-    ws.send(JSON.stringify({ type: "connection", ok: true }));
+    ws.send(JSON.stringify({ type: "hello", msg: "WS OK" }));
 
-    ws.on("close", () => clients.delete(ws));
+    ws.on("close", () => {
+        console.log("❌ Клиент отключился");
+    });
 });
 
+function broadcast(data) {
+    const json = JSON.stringify(data);
+    wss.clients.forEach((client) => {
+        if (client.readyState === 1) client.send(json);
+    });
+}
 
-// === Подключаемся к Coinbase WS ===
-const cb = new WebSocket("wss://ws-feed.exchange.coinbase.com");
+// ========== PRICE DATA ==========
+let currentPrice = 0;
+let candleHistory = []; // для графика
 
-cb.on("open", () => {
-    console.log("Connected to Coinbase");
-    cb.send(JSON.stringify({
-        type: "subscribe",
-        product_ids: ["BTC-USD"],
-        channels: ["ticker"]
-    }));
-});
+function connectCoinbase() {
+    const ws = new WebSocketClient("wss://ws-feed.exchange.coinbase.com");
 
-cb.on("message", msg => {
-    try {
+    ws.on("open", () => {
+        console.log("📡 Coinbase подключен");
+
+        // Подписка на тикер и свечи
+        ws.send(JSON.stringify({
+            type: "subscribe",
+            product_ids: ["BTC-USD"],
+            channels: ["ticker", "candles"]
+        }));
+    });
+
+    ws.on("message", (msg) => {
         const data = JSON.parse(msg);
 
-        if (!data.price) return;
+        // Текущая цена
+        if (data.type === "ticker" && data.price) {
+            currentPrice = Number(data.price);
+            broadcast({
+                type: "price",
+                symbol: "BTC-USD",
+                price: currentPrice,
+                ts: Date.now()
+            });
+        }
 
-        const payload = JSON.stringify({
-            type: "price",
-            price: Number(data.price),
-            time: Date.now()
-        });
+        // История свечей
+        if (data.type === "candles" && data.data) {
+            // data.data = [{time, open, high, low, close}]
+            candleHistory = data.data.map(c => ({
+                time: c.time, open: c.open, high: c.high, low: c.low, close: c.close
+            }));
+            broadcast({ type: "history", data: candleHistory });
+        }
+    });
 
-        // Рассылаем всем клиентам
-        for (const c of clients) c.send(payload);
+    ws.on("close", () => {
+        console.log("⚠ Coinbase отключился. Переподключение через 5 сек...");
+        setTimeout(connectCoinbase, 5000);
+    });
 
-    } catch (e) {
-        console.error("Parse error:", e);
-    }
+    ws.on("error", (e) => console.log("Coinbase WS error:", e));
+}
+
+connectCoinbase();
+
+// ========== HTTP ENDPOINT ==========
+app.get("/price", (req, res) => {
+    res.json({ price: currentPrice, candles: candleHistory });
 });
+
+// ========== RUN SERVER ==========
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => console.log(`WS Price Server B running on ${PORT}`));
