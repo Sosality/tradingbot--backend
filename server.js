@@ -1,153 +1,158 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import jwt from "jsonwebtoken";
-import crypto from "crypto";
-import pkg from "pg";
+/**
+ * price-server.js
+ * WS server that streams BTC-USD price & minute candles.
+ *
+ * Usage: node price-server.js
+ */
 
-dotenv.config();
-const { Pool } = pkg;
+import WebSocket from "ws";
+import http from "http";
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// Coinbase WS endpoint
+const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
-// DB CONNECT
-const db = new Pool({
-    host: process.env.PG_HOST,
-    port: process.env.PG_PORT,
-    database: process.env.PG_DATABASE,
-    user: process.env.PG_USER,
-    password: process.env.PG_PASSWORD,
-    ssl: { rejectUnauthorized: false }
-});
+// Port for our WS server
+const PORT = process.env.PRICE_WS_PORT ? Number(process.env.PRICE_WS_PORT) : 4000;
 
-// Validate Telegram initData
-function validateTelegram(initData) {
-    const urlParams = new URLSearchParams(initData);
-    const hash = urlParams.get('hash');
-    urlParams.delete("hash");
+// In-memory storage
+let candles = []; // {time: unixSec, open, high, low, close}
+let currentCandle = null;
+let lastPrice = 0;
+let trades = []; // recent trades
+let orderBook = { buy: [], sell: [] }; // simulated small book
 
-    const dataCheckString = [...urlParams.entries()]
-        .map(([k, v]) => `${k}=${v}`)
-        .sort()
-        .join("\n");
+// Connect to Coinbase
+function connectCoinbase() {
+  const ws = new WebSocket(COINBASE_WS);
 
-    const secretKey = crypto
-        .createHmac("sha256", "WebAppData")
-        .update(process.env.BOT_TOKEN)
-        .digest();
+  ws.on("open", () => {
+    console.log("Connected to Coinbase WS. Subscribing to BTC-USD ticker...");
+    ws.send(JSON.stringify({
+      type: "subscribe",
+      product_ids: ["BTC-USD"],
+      channels: ["ticker"]
+    }));
+  });
 
-    const checkHash = crypto
-        .createHmac("sha256", secretKey)
-        .update(dataCheckString)
-        .digest("hex");
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === "ticker" && msg.product_id === "BTC-USD") {
+        const p = parseFloat(msg.price);
+        const t = Math.floor(Date.now() / 1000);
+        onPriceTick(p, t, msg);
+      }
+    } catch (e) {
+      // ignore parse errors
+    }
+  });
 
-    return checkHash === hash;
+  ws.on("close", () => {
+    console.log("Coinbase WS closed. Reconnect in 5s...");
+    setTimeout(connectCoinbase, 5000);
+  });
+
+  ws.on("error", (err) => {
+    console.error("Coinbase WS error:", err.message || err);
+  });
 }
 
-// Create user in DB if not exists
-async function ensureUser(userId) {
-    const res = await db.query(
-        `INSERT INTO users (id, balance)
-         VALUES ($1, 10000)
-         ON CONFLICT (id) DO NOTHING
-         RETURNING *`,
-        [userId]
-    );
+function onPriceTick(price, unixSec, rawMsg) {
+  if (!currentCandle) {
+    const minute = Math.floor(unixSec / 60) * 60;
+    currentCandle = { time: minute, open: price, high: price, low: price, close: price };
+  } else {
+    const minute = Math.floor(unixSec / 60) * 60;
+    if (minute !== currentCandle.time) {
+      // push previous and start new
+      candles.push(currentCandle);
+      if (candles.length > 500) candles.shift();
+      currentCandle = { time: minute, open: price, high: price, low: price, close: price };
+    } else {
+      currentCandle.high = Math.max(currentCandle.high, price);
+      currentCandle.low = Math.min(currentCandle.low, price);
+      currentCandle.close = price;
+    }
+  }
+  lastPrice = price;
 
-    if (res.rows.length > 0) return res.rows[0];
+  // push trade snapshot to recent trades (simulate)
+  trades.push({ price, size: (Math.random()*0.01)+0.001, side: (Math.random()>0.5?'buy':'sell'), time: Date.now() });
+  if (trades.length > 200) trades.shift();
 
-    const user = await db.query(`SELECT * FROM users WHERE id=$1`, [userId]);
-    return user.rows[0];
+  // generate small simulated order book near price
+  generateOrderBook(price);
+
+  // broadcast to clients
+  broadcast({
+    type: "price",
+    data: { price: lastPrice, change24h: 0 } // change24h left as 0; could be calculated via external API
+  });
+
+  broadcast({
+    type: "trades",
+    data: trades.slice(-50)
+  });
+
+  // send current candle update
+  if (currentCandle) {
+    broadcast({ type: "candle_update", data: currentCandle });
+  }
 }
 
-// Init app request
-app.post("/api/init", async (req, res) => {
-    const { initData } = req.body;
-    if (!initData || !validateTelegram(initData))
-        return res.json({ error: "Auth failed" });
+function generateOrderBook(mid) {
+  const levels = 12;
+  const spread = Math.max(1, mid * 0.002); // ~0.2%
+  const buy = [];
+  const sell = [];
+  for (let i=levels; i>=1; i--) {
+    buy.push({ price: +(mid - i * spread).toFixed(2), size: +(Math.random()*1).toFixed(4) });
+  }
+  for (let i=1; i<=levels; i++) {
+    sell.push({ price: +(mid + i * spread).toFixed(2), size: +(Math.random()*1).toFixed(4) });
+  }
+  orderBook = { buy, sell };
+}
 
-    const userData = Object.fromEntries(
-        new URLSearchParams(initData)
-    );
+// Simple WS server
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
 
-    const userId = userData.user
-        ? JSON.parse(userData.user).id
-        : null;
+function broadcast(obj) {
+  const s = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) c.send(s);
+  });
+}
 
-    if (!userId) return res.json({ error: "No user" });
+wss.on("connection", (ws, req) => {
+  console.log("Client connected:", req.socket.remoteAddress);
 
-    const user = await ensureUser(userId);
+  // On connection, send history (candles + currentCandle)
+  const history = candles.slice(-300); // last minutes
+  if (currentCandle) history.push(currentCandle);
+  ws.send(JSON.stringify({ type: "history", data: history }));
 
-    const token = jwt.sign({ userId }, process.env.JWT_SECRET);
+  // send initial orderbook & trades & price
+  ws.send(JSON.stringify({ type: "orderBook", data: orderBook }));
+  ws.send(JSON.stringify({ type: "trades", data: trades.slice(-50) }));
+  ws.send(JSON.stringify({ type: "price", data: { price: lastPrice, change24h: 0 } }));
 
-    res.json({
-        ok: true,
-        token,
-        balance: user.balance,
-        positions: []
-    });
+  ws.on("message", (msg) => {
+    // client can subscribe etc.
+    try {
+      const m = JSON.parse(msg.toString());
+      if (m.type === 'subscribe' && m.pair) {
+        // nothing special for now
+        ws.send(JSON.stringify({ type:'info', data:`subscribed to ${m.pair}` }));
+      }
+    } catch (e){}
+  });
+
+  ws.on("close", ()=>console.log("Client disconnected"));
 });
 
-// Get current price (fake or api later)
-app.get("/api/price", (req, res) => {
-    const price = 95000 + Math.random() * 1000;
-    res.json({ price });
+server.listen(PORT, () => {
+  console.log(`Price WS server listening on ${PORT}`);
+  connectCoinbase();
 });
-
-// Open a position
-app.post("/api/order/open", async (req, res) => {
-    const { userId, type, margin, leverage } = req.body;
-
-    const user = await db.query("SELECT balance FROM users WHERE id=$1", [userId]);
-    if (!user.rows.length) return res.json({ error: "No user" });
-
-    const balance = user.rows[0].balance;
-    if (balance < margin) return res.json({ error: "Not enough funds" });
-
-    await db.query(
-        `UPDATE users SET balance = balance - $1 WHERE id=$2`,
-        [margin, userId]
-    );
-
-    const position = await db.query(
-        `INSERT INTO positions (user_id, type, margin, leverage, entry_price)
-         VALUES ($1,$2,$3,$4,95000)
-         RETURNING *`,
-        [userId, type, margin, leverage]
-    );
-
-    res.json({
-        balance: balance - margin,
-        position: position.rows[0]
-    });
-});
-
-// Close position
-app.post("/api/order/close", async (req, res) => {
-    const { userId, positionId } = req.body;
-
-    const position = await db.query(
-        `SELECT * FROM positions WHERE id=$1 AND user_id=$2`,
-        [positionId, userId]
-    );
-    if (!position.rows.length) return res.json({ error: "Position not found" });
-
-    const pnl = Math.round((Math.random() - 0.5) * position.rows[0].margin); // fake calc
-    await db.query(
-        `UPDATE users SET balance = balance + $1 WHERE id=$2`,
-        [position.rows[0].margin + pnl, userId]
-    );
-
-    await db.query(`DELETE FROM positions WHERE id=$1`, [positionId]);
-
-    const updatedBalance = await db.query("SELECT balance FROM users WHERE id=$1", [userId]);
-
-    res.json({
-        balance: updatedBalance.rows[0].balance
-    });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on " + PORT));
