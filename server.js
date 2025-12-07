@@ -4,9 +4,9 @@ dotenv.config();
 
 import express from "express";
 import http from "http";
-import { WebSocketServer } from "ws";
 import cors from "cors";
-import WebSocketClient from "ws"; // для подключения к Coinbase
+import fetch from "node-fetch";
+import WebSocket, { WebSocketServer } from "ws";
 
 const app = express();
 app.use(cors());
@@ -15,237 +15,247 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// ========================
-// Internal state
-// ========================
-let currentPrice = 0;
-let candleHistory = []; // [{ time: <unix seconds>, open, high, low, close }]
-let orderBook = { buy: [], sell: [] }; // top levels
-let recentTrades = []; // array of latest trades {price,size,side,time}
-const MAX_TRADES = 200;
+/**
+ * Config
+ */
+const PRODUCTS = ["BTC-USD", "ETH-USD"];
+const COINBASE_REST = "https://api.pro.coinbase.com";
+const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
-// ========================
-// Utility: broadcast to all clients
-// ========================
-function broadcast(obj) {
-  const j = JSON.stringify(obj);
-  for (const client of wss.clients) {
-    if (client.readyState === client.OPEN) {
-      try { client.send(j); } catch (e) { /* ignore */ }
-    }
-  }
+const historyStore = {};   // { 'BTC-USD': [ {time,open,high,low,close}, ... ] }
+const orderbookStore = {}; // { 'BTC-USD': { bids: Map, asks: Map } }
+const tradesStore = {};    // { 'BTC-USD': [ {price,size,side,time}, ... ] }
+let latestPrice = {};      // { 'BTC-USD': 12345.67 }
+
+/**
+ * Utility
+ */
+function toNumberSafe(v){ return v === null || v === undefined ? 0 : Number(v); }
+function mapCandlesFromCoinbase(arr){
+  // Coinbase pro returns [ time, low, high, open, close, volume ]
+  // We want ascending time objects { time, open, high, low, close }
+  return arr
+    .map(item => ({
+      time: Math.floor(item[0]), // epoch seconds
+      open: Number(item[3]),
+      high: Number(item[2]),
+      low: Number(item[1]),
+      close: Number(item[4])
+    }))
+    .sort((a,b)=>a.time - b.time);
 }
 
-// ========================
-// When a client connects -> send current state
-// ========================
-wss.on("connection", (ws, req) => {
-  console.log("WS client connected", req.socket.remoteAddress);
-
-  // hello
-  ws.send(JSON.stringify({ type: "hello", msg: "price-ws OK" }));
-
-  // send current price
-  if (currentPrice && currentPrice > 0) {
-    ws.send(JSON.stringify({ type: "price", price: currentPrice, ts: Date.now() }));
-  }
-
-  // send history (candles)
-  if (candleHistory && candleHistory.length) {
-    ws.send(JSON.stringify({ type: "history", data: candleHistory }));
-  }
-
-  // send orderbook snapshot
-  ws.send(JSON.stringify({ type: "orderbook", buy: orderBook.buy, sell: orderBook.sell }));
-
-  // send recent trades
-  ws.send(JSON.stringify({ type: "trades", data: recentTrades.slice(-50) }));
-
-  ws.on("message", msg => {
-    // optional: clients might request something
-    try {
-      const parsed = JSON.parse(msg.toString());
-      if (parsed && parsed.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
-      }
-    } catch (e) {}
-  });
-
-  ws.on("close", () => console.log("WS client disconnected"));
-});
-
-// ========================
-// Load initial candle history from Binance (public REST)
-// ========================
-async function loadInitialCandles() {
+/**
+ * Fetch historical candles (1m granularity)
+ */
+async function loadHistoryFor(product){
   try {
-    const res = await fetch("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=200");
-    if (!res.ok) throw new Error("binance klines failed " + res.status);
-    const data = await res.json();
-    // data: [[openTime, open, high, low, close, ...], ...]
-    candleHistory = data.map(c => ({
-      time: Math.floor(c[0] / 1000), // unix seconds
-      open: parseFloat(c[1]),
-      high: parseFloat(c[2]),
-      low: parseFloat(c[3]),
-      close: parseFloat(c[4])
-    }));
-    if (candleHistory.length) {
-      currentPrice = candleHistory[candleHistory.length - 1].close;
-    }
-    console.log("Loaded", candleHistory.length, "candles from Binance");
-  } catch (e) {
-    console.warn("Failed loading initial candles:", e.message);
-    candleHistory = [];
+    const url = `${COINBASE_REST}/products/${product}/candles?granularity=60&limit=300`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const arr = await res.json();
+    historyStore[product] = mapCandlesFromCoinbase(arr);
+    console.log(`Loaded history for ${product}, ${historyStore[product].length} candles`);
+  } catch (err) {
+    console.error("History load error for", product, err);
+    historyStore[product] = historyStore[product] || [];
   }
 }
 
-// ========================
-// Coinbase WebSocket connection
-// ========================
-function connectCoinbase() {
-  const ws = new WebSocketClient("wss://ws-feed.exchange.coinbase.com");
+/**
+ * Orderbook helpers
+ */
+function createEmptyOrderbook(){
+  return { bids: new Map(), asks: new Map() };
+}
+function orderbookToArray(ob, side, limit = 50){
+  const arr = [...(side === "buy" ? ob.bids.entries() : ob.asks.entries())]
+    .map(([price, size]) => ({ price: Number(price), size: Number(size) }));
+  if (side === "buy") arr.sort((a,b)=>b.price - a.price);
+  else arr.sort((a,b)=>a.price - b.price);
+  return arr.slice(0, limit);
+}
 
-  ws.on("open", () => {
-    console.log("Connected to Coinbase WS, subscribing...");
-    // subscribe to ticker, level2 (orderbook), matches (trades)
-    ws.send(JSON.stringify({
-      type: "subscribe",
-      product_ids: ["BTC-USD"],
-      channels: ["ticker", "level2", "matches"]
-    }));
-  });
-
-  ws.on("message", (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch (e) {
-      return;
-    }
-
-    // Ticker: current price
-    if (data.type === "ticker" && data.price) {
-      const p = Number(data.price);
-      if (isFinite(p) && p > 0) {
-        currentPrice = p;
-        broadcast({ type: "price", price: currentPrice, ts: Date.now() });
-        // also update candleHistory last candle's close if same minute OR create new minute candle
-        try {
-          const nowSec = Math.floor(Date.now() / 1000);
-          const minute = Math.floor(nowSec / 60) * 60;
-          const last = candleHistory[candleHistory.length - 1];
-          if (!last || last.time !== minute) {
-            // push new candle (open/high/low/close based on price)
-            const newCandle = { time: minute, open: p, high: p, low: p, close: p };
-            candleHistory.push(newCandle);
-            // keep last 500 candles max
-            if (candleHistory.length > 1000) candleHistory.shift();
-            // broadcast new minute start as candle_update
-            broadcast({ type: "candle_update", data: newCandle });
-          } else {
-            // update last candle
-            last.high = Math.max(last.high, p);
-            last.low = Math.min(last.low, p);
-            last.close = p;
-            broadcast({ type: "candle_update", data: last });
-          }
-        } catch(e){}
-      }
-    }
-
-    // Level2 snapshot: initial orderbook
-    if (data.type === "snapshot" && data.product_id === "BTC-USD") {
-      // data.bids = [[price, size], ...] (strings)
-      const buys = (data.bids || []).map(b => ({ price: Number(b[0]), size: Number(b[1]) }));
-      const sells = (data.asks || []).map(a => ({ price: Number(a[0]), size: Number(a[1]) }));
-      // keep top 50 each (desc buys, asc sells)
-      orderBook.buy = buys.slice(0, 100).sort((a,b)=>b.price-a.price);
-      orderBook.sell = sells.slice(0, 100).sort((a,b)=>a.price-b.price);
-      broadcast({ type: "orderbook", buy: orderBook.buy.slice(0,50), sell: orderBook.sell.slice(0,50) });
-    }
-
-    // Level2 updates: l2update -> changes: [[side, price, size], ...]
-    if (data.type === "l2update" && Array.isArray(data.changes)) {
-      data.changes.forEach(ch => {
-        const [side, priceStr, sizeStr] = ch;
-        const price = Number(priceStr);
-        const size = Number(sizeStr);
-        if (!isFinite(price)) return;
-        if (side === "buy") {
-          // update buy side: replace price level or add/remove if size=0
-          const idx = orderBook.buy.findIndex(x=>x.price===price);
-          if (size === 0) {
-            if (idx !== -1) orderBook.buy.splice(idx,1);
-          } else {
-            if (idx === -1) orderBook.buy.push({ price, size });
-            else orderBook.buy[idx].size = size;
-          }
-          orderBook.buy.sort((a,b)=>b.price-a.price);
-          orderBook.buy = orderBook.buy.slice(0,200);
-        } else { // sell
-          const idx = orderBook.sell.findIndex(x=>x.price===price);
-          if (size === 0) {
-            if (idx !== -1) orderBook.sell.splice(idx,1);
-          } else {
-            if (idx === -1) orderBook.sell.push({ price, size });
-            else orderBook.sell[idx].size = size;
-          }
-          orderBook.sell.sort((a,b)=>a.price-b.price);
-          orderBook.sell = orderBook.sell.slice(0,200);
-        }
-      });
-      broadcast({ type: "orderbook", buy: orderBook.buy.slice(0,50), sell: orderBook.sell.slice(0,50) });
-    }
-
-    // Matches -> trade events
-    if (data.type === "match" && data.product_id === "BTC-USD") {
-      const t = {
-        price: Number(data.price),
-        size: Number(data.size),
-        side: data.side, // 'buy' means taker side buy
-        time: data.time
-      };
-      if (isFinite(t.price) && t.price > 0) {
-        recentTrades.push(t);
-        if (recentTrades.length > MAX_TRADES) recentTrades.shift();
-        broadcast({ type: "trade", data: t });
-      }
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("Coinbase WS closed — reconnecting in 5s");
-    setTimeout(connectCoinbase, 5000);
-  });
-
-  ws.on("error", (e) => {
-    console.log("Coinbase WS error:", e && e.message ? e.message : e);
+/**
+ * Broadcast helper
+ */
+function broadcast(msg){
+  const text = JSON.stringify(msg);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(text);
   });
 }
 
-// ========================
-// HTTP endpoints
-// ========================
-app.get("/price", (req, res) => {
-  res.json({ price: currentPrice, candles: candleHistory.slice(-200) });
+/**
+ * Start Coinbase WebSocket connection
+ * Subscribe to ticker, level2, matches for PRODUCTS
+ */
+let coinbaseWS = null;
+function connectCoinbaseWS(){
+  coinbaseWS = new WebSocket(COINBASE_WS);
+
+  coinbaseWS.on("open", () => {
+    console.log("Connected to Coinbase WS, subscribing...");
+    const subscribeMsg = {
+      type: "subscribe",
+      product_ids: PRODUCTS,
+      channels: ["ticker", "level2", "matches"]
+    };
+    coinbaseWS.send(JSON.stringify(subscribeMsg));
+  });
+
+  coinbaseWS.on("message", raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      handleCoinbaseMessage(msg);
+    } catch (err) {
+      // ignore parse errors
+      console.error("WS parse err", err);
+    }
+  });
+
+  coinbaseWS.on("close", () => {
+    console.warn("Coinbase WS closed - reconnect in 5s");
+    setTimeout(connectCoinbaseWS, 5000);
+  });
+
+  coinbaseWS.on("error", (e) => {
+    console.error("Coinbase WS error:", e && e.message ? e.message : e);
+  });
+}
+
+/**
+ * Handle incoming Coinbase WS messages
+ */
+function handleCoinbaseMessage(msg){
+  const type = msg.type;
+  if (!type) return;
+
+  if (type === "snapshot" && msg.product_id) {
+    const pair = msg.product_id;
+    // msg.bids, msg.asks => arrays [ [price, size], ... ]
+    orderbookStore[pair] = createEmptyOrderbook();
+    for (const [price, size] of msg.bids || []) {
+      if (Number(size) > 0) orderbookStore[pair].bids.set(price, Number(size));
+    }
+    for (const [price, size] of msg.asks || []) {
+      if (Number(size) > 0) orderbookStore[pair].asks.set(price, Number(size));
+    }
+    // broadcast initial orderbook
+    broadcast({
+      type: "orderBook",
+      pair,
+      buy: orderbookToArray(orderbookStore[pair], "buy", 50),
+      sell: orderbookToArray(orderbookStore[pair], "sell", 50)
+    });
+  } else if (type === "l2update" && msg.product_id) {
+    const pair = msg.product_id;
+    const changes = msg.changes || []; // [ [side, price, size], ... ]
+    if (!orderbookStore[pair]) orderbookStore[pair] = createEmptyOrderbook();
+    for (const [side, price, sizeStr] of changes){
+      const size = Number(sizeStr);
+      if (side === "buy") {
+        if (size === 0) orderbookStore[pair].bids.delete(price);
+        else orderbookStore[pair].bids.set(price, size);
+      } else {
+        if (size === 0) orderbookStore[pair].asks.delete(price);
+        else orderbookStore[pair].asks.set(price, size);
+      }
+    }
+    // broadcast orderbook snapshot (top N)
+    broadcast({
+      type: "orderBook",
+      pair,
+      buy: orderbookToArray(orderbookStore[pair], "buy", 50),
+      sell: orderbookToArray(orderbookStore[pair], "sell", 50)
+    });
+  } else if (type === "ticker" && msg.product_id) {
+    const pair = msg.product_id;
+    const price = Number(msg.price);
+    latestPrice[pair] = price;
+    broadcast({ type: "price", pair, price, ts: Date.now() });
+  } else if (type === "match" || type === "matches") {
+    // single trade incoming
+    // msg: { type: 'match', trade_id, maker_order_id, taker_order_id, side, size, price, product_id, sequence, time }
+    const trade = {
+      price: Number(msg.price),
+      size: Number(msg.size),
+      side: msg.side,
+      time: new Date(msg.time).getTime()
+    };
+    const pair = msg.product_id;
+    tradesStore[pair] = tradesStore[pair] || [];
+    tradesStore[pair].push(trade);
+    if (tradesStore[pair].length > 500) tradesStore[pair].shift();
+    broadcast({ type: "trades", pair, trades: tradesStore[pair].slice(-100) });
+  }
+}
+
+/**
+ * Init stores and start
+ */
+async function initAll(){
+  for (const p of PRODUCTS) {
+    historyStore[p] = [];
+    orderbookStore[p] = createEmptyOrderbook();
+    tradesStore[p] = [];
+    latestPrice[p] = 0;
+    await loadHistoryFor(p);
+    // send initial history to clients (if any)
+    // we'll broadcast on WS client connect
+  }
+  connectCoinbaseWS();
+
+  // Periodically broadcast price + small heartbeat (every 2s)
+  setInterval(()=>{
+    for (const p of PRODUCTS) {
+      if (latestPrice[p]) {
+        broadcast({ type: "price", pair: p, price: latestPrice[p], ts: Date.now() });
+      }
+    }
+  }, 2000);
+}
+
+initAll().catch(e=>console.error("init error", e));
+
+/**
+ * WS server: on client connect send current snapshots (history, orderbook, trades, price)
+ */
+wss.on("connection", (ws) => {
+  console.log("Client connected to price WS, sending initial data");
+  // send hello
+  ws.send(JSON.stringify({ type: "hello", msg: "price-ws OK", pairs: PRODUCTS }));
+
+  // send history + orderbook + trades + current price
+  for (const p of PRODUCTS) {
+    const hist = historyStore[p] || [];
+    if (hist.length) ws.send(JSON.stringify({ type: "history", pair: p, data: hist }));
+    const ob = orderbookStore[p] || createEmptyOrderbook();
+    ws.send(JSON.stringify({
+      type: "orderBook",
+      pair: p,
+      buy: orderbookToArray(ob, "buy", 50),
+      sell: orderbookToArray(ob, "sell", 50)
+    }));
+    ws.send(JSON.stringify({ type: "trades", pair: p, trades: tradesStore[p] || [] }));
+    if (latestPrice[p]) ws.send(JSON.stringify({ type: "price", pair: p, price: latestPrice[p] }));
+  }
+
+  ws.on("close", () => console.log("Client disconnected (price WS)"));
 });
 
-app.get("/orderbook", (req, res) => {
-  res.json({ buy: orderBook.buy.slice(0,50), sell: orderBook.sell.slice(0,50) });
+/**
+ * Simple HTTP endpoints (optional)
+ */
+app.get("/health", (req,res)=>res.json({ ok: true }));
+app.get("/price", (req,res)=> res.json({ price: latestPrice, pairs: PRODUCTS }));
+app.get("/history/:pair", (req,res)=>{
+  const pair = req.params.pair;
+  res.json({ pair, candles: historyStore[pair] || [] });
 });
 
-app.get("/trades", (req, res) => {
-  res.json({ trades: recentTrades.slice(-200) });
-});
-
-// ========================
-// Start server
-// ========================
+/**
+ * Start
+ */
 const PORT = process.env.PORT || 8080;
-await loadInitialCandles();
-connectCoinbase();
-
-server.listen(PORT, () => {
-  console.log(`Price WebSocket server running on port ${PORT}`);
-});
+server.listen(PORT, ()=> console.log(`Price WS server running on port ${PORT}`));
