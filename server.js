@@ -27,13 +27,9 @@ const orderbookStore = {}; // { 'BTC-USD': { bids: Map, asks: Map } }
 const tradesStore = {};    // { 'BTC-USD': [ {price,size,side,time}, ... ] }
 let latestPrice = {};      // { 'BTC-USD': 12345.67 }
 
-/**
- * Utility
- */
-function toNumberSafe(v){ return v === null || v === undefined ? 0 : Number(v); }
+/** Utils */
 function mapCandlesFromCoinbase(arr){
   // Coinbase pro returns [ time, low, high, open, close, volume ]
-  // We want ascending time objects { time, open, high, low, close }
   return arr
     .map(item => ({
       time: Math.floor(item[0]), // epoch seconds
@@ -44,10 +40,40 @@ function mapCandlesFromCoinbase(arr){
     }))
     .sort((a,b)=>a.time - b.time);
 }
+function createEmptyOrderbook(){ return { bids: new Map(), asks: new Map() }; }
+function orderbookToArray(ob, side, limit = 50){
+  const arr = [...(side === "buy" ? ob.bids.entries() : ob.asks.entries())]
+    .map(([price, size]) => ({ price: Number(price), size: Number(size) }));
+  if (side === "buy") arr.sort((a,b)=>b.price - a.price);
+  else arr.sort((a,b)=>a.price - b.price);
+  return arr.slice(0, limit);
+}
 
-/**
- * Fetch historical candles (1m granularity)
+/** Broadcast with subscription-aware filtering:
+ *  If client has a non-empty ws.subscriptions Set, we only send pair-messages
+ *  for pairs that are in that Set. If client.subscriptions is empty, it's treated
+ *  as "no-filter" (backwards compatible).
  */
+function broadcast(msg){
+  const text = JSON.stringify(msg);
+  const pair = msg.pair;
+  wss.clients.forEach(client => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    try {
+      const subs = client.subscriptions;
+      if (pair && subs && subs.size > 0) {
+        if (subs.has(pair)) client.send(text);
+      } else {
+        // no pair or client has no subscriptions -> send
+        client.send(text);
+      }
+    } catch(e){
+      // ignore client send errors
+    }
+  });
+}
+
+/** Fetch historical candles (1m, limit 300) */
 async function loadHistoryFor(product){
   try {
     const url = `${COINBASE_REST}/products/${product}/candles?granularity=60&limit=300`;
@@ -62,34 +88,7 @@ async function loadHistoryFor(product){
   }
 }
 
-/**
- * Orderbook helpers
- */
-function createEmptyOrderbook(){
-  return { bids: new Map(), asks: new Map() };
-}
-function orderbookToArray(ob, side, limit = 50){
-  const arr = [...(side === "buy" ? ob.bids.entries() : ob.asks.entries())]
-    .map(([price, size]) => ({ price: Number(price), size: Number(size) }));
-  if (side === "buy") arr.sort((a,b)=>b.price - a.price);
-  else arr.sort((a,b)=>a.price - b.price);
-  return arr.slice(0, limit);
-}
-
-/**
- * Broadcast helper
- */
-function broadcast(msg){
-  const text = JSON.stringify(msg);
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(text);
-  });
-}
-
-/**
- * Start Coinbase WebSocket connection
- * Subscribe to ticker, level2, matches for PRODUCTS
- */
+/** Coinbase WS connection and handling */
 let coinbaseWS = null;
 function connectCoinbaseWS(){
   coinbaseWS = new WebSocket(COINBASE_WS);
@@ -109,7 +108,6 @@ function connectCoinbaseWS(){
       const msg = JSON.parse(raw.toString());
       handleCoinbaseMessage(msg);
     } catch (err) {
-      // ignore parse errors
       console.error("WS parse err", err);
     }
   });
@@ -124,16 +122,12 @@ function connectCoinbaseWS(){
   });
 }
 
-/**
- * Handle incoming Coinbase WS messages
- */
 function handleCoinbaseMessage(msg){
   const type = msg.type;
   if (!type) return;
 
   if (type === "snapshot" && msg.product_id) {
     const pair = msg.product_id;
-    // msg.bids, msg.asks => arrays [ [price, size], ... ]
     orderbookStore[pair] = createEmptyOrderbook();
     for (const [price, size] of msg.bids || []) {
       if (Number(size) > 0) orderbookStore[pair].bids.set(price, Number(size));
@@ -141,7 +135,6 @@ function handleCoinbaseMessage(msg){
     for (const [price, size] of msg.asks || []) {
       if (Number(size) > 0) orderbookStore[pair].asks.set(price, Number(size));
     }
-    // broadcast initial orderbook
     broadcast({
       type: "orderBook",
       pair,
@@ -150,7 +143,7 @@ function handleCoinbaseMessage(msg){
     });
   } else if (type === "l2update" && msg.product_id) {
     const pair = msg.product_id;
-    const changes = msg.changes || []; // [ [side, price, size], ... ]
+    const changes = msg.changes || [];
     if (!orderbookStore[pair]) orderbookStore[pair] = createEmptyOrderbook();
     for (const [side, price, sizeStr] of changes){
       const size = Number(sizeStr);
@@ -162,7 +155,6 @@ function handleCoinbaseMessage(msg){
         else orderbookStore[pair].asks.set(price, size);
       }
     }
-    // broadcast orderbook snapshot (top N)
     broadcast({
       type: "orderBook",
       pair,
@@ -174,9 +166,7 @@ function handleCoinbaseMessage(msg){
     const price = Number(msg.price);
     latestPrice[pair] = price;
     broadcast({ type: "price", pair, price, ts: Date.now() });
-  } else if (type === "match" || type === "matches") {
-    // single trade incoming
-    // msg: { type: 'match', trade_id, maker_order_id, taker_order_id, side, size, price, product_id, sequence, time }
+  } else if ((type === "match" || type === "matches") && msg.product_id) {
     const trade = {
       price: Number(msg.price),
       size: Number(msg.size),
@@ -191,9 +181,7 @@ function handleCoinbaseMessage(msg){
   }
 }
 
-/**
- * Init stores and start
- */
+/** Initialize stores and start */
 async function initAll(){
   for (const p of PRODUCTS) {
     historyStore[p] = [];
@@ -201,52 +189,59 @@ async function initAll(){
     tradesStore[p] = [];
     latestPrice[p] = 0;
     await loadHistoryFor(p);
-    // send initial history to clients (if any)
-    // we'll broadcast on WS client connect
   }
   connectCoinbaseWS();
 
-  // Periodically broadcast price + small heartbeat (every 2s)
-  setInterval(()=>{
+  // Periodic heartbeat price broadcast (in case ticker missed)
+  setInterval(()=> {
     for (const p of PRODUCTS) {
-      if (latestPrice[p]) {
-        broadcast({ type: "price", pair: p, price: latestPrice[p], ts: Date.now() });
-      }
+      if (latestPrice[p]) broadcast({ type: "price", pair: p, price: latestPrice[p], ts: Date.now() });
     }
   }, 2000);
 }
 
 initAll().catch(e=>console.error("init error", e));
 
-/**
- * WS server: on client connect send current snapshots (history, orderbook, trades, price)
- */
+/** WS connections: support per-client subscriptions */
 wss.on("connection", (ws) => {
-  console.log("Client connected to price WS, sending initial data");
-  // send hello
+  ws.subscriptions = new Set(); // if empty -> no-filter (client sees broadcasts)
+  console.log("Client connected to price WS, waiting for subscribe messages.");
+
+  // Send hello with available pairs
   ws.send(JSON.stringify({ type: "hello", msg: "price-ws OK", pairs: PRODUCTS }));
 
-  // send history + orderbook + trades + current price
-  for (const p of PRODUCTS) {
-    const hist = historyStore[p] || [];
-    if (hist.length) ws.send(JSON.stringify({ type: "history", pair: p, data: hist }));
-    const ob = orderbookStore[p] || createEmptyOrderbook();
-    ws.send(JSON.stringify({
-      type: "orderBook",
-      pair: p,
-      buy: orderbookToArray(ob, "buy", 50),
-      sell: orderbookToArray(ob, "sell", 50)
-    }));
-    ws.send(JSON.stringify({ type: "trades", pair: p, trades: tradesStore[p] || [] }));
-    if (latestPrice[p]) ws.send(JSON.stringify({ type: "price", pair: p, price: latestPrice[p] }));
-  }
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg && msg.type === 'subscribe' && msg.pair) {
+        const pair = msg.pair;
+        ws.subscriptions.add(pair);
+        // send immediate snapshot for that pair
+        const hist = historyStore[pair] || [];
+        if (hist.length) ws.send(JSON.stringify({ type: "history", pair, data: hist }));
+        const ob = orderbookStore[pair] || createEmptyOrderbook();
+        ws.send(JSON.stringify({
+          type: "orderBook",
+          pair,
+          buy: orderbookToArray(ob, "buy", 50),
+          sell: orderbookToArray(ob, "sell", 50)
+        }));
+        ws.send(JSON.stringify({ type: "trades", pair, trades: tradesStore[pair] || [] }));
+        if (latestPrice[pair]) ws.send(JSON.stringify({ type: "price", pair, price: latestPrice[pair] }));
+      } else if (msg && msg.type === 'unsubscribe' && msg.pair) {
+        ws.subscriptions.delete(msg.pair);
+      }
+    } catch (err) {
+      // ignore parse errors
+    }
+  });
 
-  ws.on("close", () => console.log("Client disconnected (price WS)"));
+  ws.on("close", () => {
+    console.log("Client disconnected (price WS)");
+  });
 });
 
-/**
- * Simple HTTP endpoints (optional)
- */
+/** Simple HTTP endpoints */
 app.get("/health", (req,res)=>res.json({ ok: true }));
 app.get("/price", (req,res)=> res.json({ price: latestPrice, pairs: PRODUCTS }));
 app.get("/history/:pair", (req,res)=>{
@@ -254,8 +249,6 @@ app.get("/history/:pair", (req,res)=>{
   res.json({ pair, candles: historyStore[pair] || [] });
 });
 
-/**
- * Start
- */
+/** Start server */
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, ()=> console.log(`Price WS server running on port ${PORT}`));
