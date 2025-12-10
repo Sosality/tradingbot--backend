@@ -15,11 +15,11 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-/**
- * CONFIG
- */
+/** CONFIG */
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
-const COINBASE_REST = "https://api.pro.coinbase.com";
+
+// ✅ ИСПРАВЛЕНО: новый работающий endpoint Coinbase
+const COINBASE_REST = "https://api.exchange.coinbase.com";
 const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
 const HISTORY_CANDLES = 1440; // целевых свечей (1d при 1m granularity)
