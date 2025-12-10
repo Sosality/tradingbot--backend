@@ -22,17 +22,18 @@ const PRODUCTS = ["BTC-USD", "ETH-USD"];
 const COINBASE_REST = "https://api.pro.coinbase.com";
 const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
-const historyStore = {};   
-const orderbookStore = {}; 
-const tradesStore = {};    
-let latestPrice = {};      
+const HISTORY_CANDLES = 1440; // целевых свечей (1d при 1m granularity)
+const GRANULARITY = 60;       // 1 minute
+const CHUNK_LIMIT = 300;      // максимум по одному запросу Coinbase
+
+const historyStore = {};
+const orderbookStore = {};
+const tradesStore = {};
+let latestPrice = {};
 
 /** UTILS */
 function mapCandlesFromCoinbase(arr){
-  // Coinbase возвращает: [ time, low, high, open, close, volume ]
-  // Lightweight charts ждет сортировку по возрастанию времени
   if (!Array.isArray(arr)) return [];
-  
   return arr
     .map(item => ({
       time: Math.floor(item[0]), // epoch seconds
@@ -61,8 +62,6 @@ function broadcast(msg){
     if (client.readyState !== WebSocket.OPEN) return;
     try {
       const subs = client.subscriptions;
-      // Если у клиента есть подписки, шлем только если пара совпадает
-      // Если подписок нет (старый клиент) или msg без пары (системное) — шлем всем
       if (pair && subs && subs.size > 0) {
         if (subs.has(pair)) client.send(text);
       } else {
@@ -72,28 +71,58 @@ function broadcast(msg){
   });
 }
 
-/** * FETCH HISTORY (ИСПРАВЛЕНО: Добавлен User-Agent)
- */
+/** FETCH HISTORY — теперь собираем несколькими запросами, чтобы получить HISTORY_CANDLES */
 async function loadHistoryFor(product){
   try {
-    const url = `${COINBASE_REST}/products/${product}/candles?granularity=60&limit=300`;
-    console.log(`Fetching history for ${product}...`);
-    
-    const res = await fetch(url, {
-        headers: {
-            'User-Agent': 'TradeSimBot/1.0',
-            'Accept': 'application/json'
-        }
-    });
+    console.log(`Fetching history for ${product} ...`);
+    const now = Math.floor(Date.now()/1000);
+    const needed = HISTORY_CANDLES;
+    const chunk = CHUNK_LIMIT;
+    let collected = [];
 
-    if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`HTTP ${res.status}: ${txt}`);
+    // We'll fetch chunks backwards from now
+    let fetched = 0;
+    while (fetched < needed) {
+      const to = now - fetched * GRANULARITY;
+      const from = to - (chunk * GRANULARITY);
+
+      const startISO = new Date(from * 1000).toISOString();
+      const endISO = new Date(to * 1000).toISOString();
+      const url = `${COINBASE_REST}/products/${product}/candles?granularity=${GRANULARITY}&start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}`;
+
+      try {
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'TradeSim/1.0', 'Accept': 'application/json' }
+        });
+
+        if (!res.ok) {
+          const txt = await res.text();
+          console.warn(`History HTTP ${res.status} for ${product}: ${txt}`);
+          break;
+        }
+
+        const arr = await res.json();
+        // arr may be [] or up to CHUNK_LIMIT entries
+        if (Array.isArray(arr) && arr.length > 0) {
+          // Coinbase returns in descending time order often — push results
+          collected = collected.concat(arr);
+        }
+      } catch (err) {
+        console.warn("History fetch error:", err.message);
+        break;
+      }
+
+      fetched += chunk;
+      // small delay to be polite (avoid rate limits)
+      await new Promise(r => setTimeout(r, 200));
     }
 
-    const arr = await res.json();
-    historyStore[product] = mapCandlesFromCoinbase(arr);
-    console.log(`Loaded history for ${product}: ${historyStore[product].length} candles`);
+    // Map and dedupe/sort, then take latest HISTORY_CANDLES
+    const mapped = mapCandlesFromCoinbase(collected);
+    // keep last 'needed' candles (most recent)
+    const latest = mapped.slice(-needed);
+    historyStore[product] = latest;
+    console.log(`Loaded history for ${product}: ${latest.length} candles`);
   } catch (err) {
     console.error(`History load error for ${product}:`, err.message);
     historyStore[product] = historyStore[product] || [];
@@ -136,7 +165,6 @@ function handleCoinbaseMessage(msg){
   if (!msg.type || !msg.product_id) return;
   const pair = msg.product_id;
 
-  // SNAPSHOT (стакан)
   if (msg.type === "snapshot") {
     orderbookStore[pair] = createEmptyOrderbook();
     for (const [price, size] of msg.bids || []) {
@@ -151,9 +179,7 @@ function handleCoinbaseMessage(msg){
       buy: orderbookToArray(orderbookStore[pair], "buy", 50),
       sell: orderbookToArray(orderbookStore[pair], "sell", 50)
     });
-  } 
-  // L2 UPDATE (обновление стакана)
-  else if (msg.type === "l2update") {
+  } else if (msg.type === "l2update") {
     const changes = msg.changes || [];
     if (!orderbookStore[pair]) orderbookStore[pair] = createEmptyOrderbook();
     for (const [side, price, sizeStr] of changes){
@@ -172,15 +198,11 @@ function handleCoinbaseMessage(msg){
       buy: orderbookToArray(orderbookStore[pair], "buy", 50),
       sell: orderbookToArray(orderbookStore[pair], "sell", 50)
     });
-  } 
-  // TICKER (цена)
-  else if (msg.type === "ticker") {
+  } else if (msg.type === "ticker") {
     const price = Number(msg.price);
     latestPrice[pair] = price;
     broadcast({ type: "price", pair, price, ts: Date.now() });
-  } 
-  // MATCH (сделки)
-  else if (msg.type === "match" || msg.type === "matches") {
+  } else if (msg.type === "match" || msg.type === "matches") {
     const trade = {
       price: Number(msg.price),
       size: Number(msg.size),
@@ -196,7 +218,6 @@ function handleCoinbaseMessage(msg){
 
 /** INIT */
 async function initAll(){
-  // 1. Сначала грузим историю для всех пар
   for (const p of PRODUCTS) {
     historyStore[p] = [];
     orderbookStore[p] = createEmptyOrderbook();
@@ -204,10 +225,7 @@ async function initAll(){
     latestPrice[p] = 0;
     await loadHistoryFor(p);
   }
-  // 2. Потом подключаемся к WS
   connectCoinbaseWS();
-
-  // Heartbeat (на случай если тикеров нет долго)
   setInterval(()=> {
     for (const p of PRODUCTS) {
       if (latestPrice[p]) broadcast({ type: "price", pair: p, price: latestPrice[p], ts: Date.now() });
@@ -217,29 +235,25 @@ async function initAll(){
 
 initAll().catch(e=>console.error("Init fatal error:", e));
 
-/** CLIENT WS CONNECTION */
+/** CLIENT WS */
 wss.on("connection", (ws) => {
   ws.subscriptions = new Set();
   console.log("Client connected (Front-end).");
-
   ws.send(JSON.stringify({ type: "hello", msg: "Server Ready", pairs: PRODUCTS }));
 
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-
       if (msg.type === 'subscribe' && msg.pair) {
         const pair = msg.pair;
         ws.subscriptions.add(pair);
-        
-        // ОТПРАВКА ИСТОРИИ (Сразу при подписке)
+
         const hist = historyStore[pair] || [];
         console.log(`Sending history for ${pair} to client (${hist.length} candles)`);
         ws.send(JSON.stringify({ type: "history", pair, data: hist }));
 
-        // Отправка текущих данных (стакан, цена, трейды)
         if (latestPrice[pair]) ws.send(JSON.stringify({ type: "price", pair, price: latestPrice[pair] }));
-        
+
         const ob = orderbookStore[pair];
         if (ob) {
             ws.send(JSON.stringify({
@@ -248,11 +262,11 @@ wss.on("connection", (ws) => {
                 sell: orderbookToArray(ob, "sell", 50)
             }));
         }
-        
+
         if (tradesStore[pair]) {
             ws.send(JSON.stringify({ type: "trades", pair, trades: tradesStore[pair].slice(-50) }));
         }
-        
+
       } else if (msg.type === 'unsubscribe' && msg.pair) {
         ws.subscriptions.delete(msg.pair);
       }
