@@ -276,7 +276,7 @@ setInterval(() => {
 wss.on("connection", ws => {
   ws.subscriptions = new Set();
 
-  ws.on("message", raw => {
+  ws.on("message", async raw => {
     try {
       const data = JSON.parse(raw.toString());
       if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
@@ -293,11 +293,21 @@ wss.on("connection", ws => {
           ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
         }
 
-        // Отправляем текущий стакан
+        // КРИТИЧНО: отправляем стакан, даже если он ещё не готов — или ждём его
         if (orderbookStore[data.pair]) {
           const buy = orderbookToArray(orderbookStore[data.pair], "buy", 15);
           const sell = orderbookToArray(orderbookStore[data.pair], "sell", 15);
           ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
+        } else {
+          // Если стакана нет — ждём 2 секунды и пробуем снова (снапшот может быть в процессе загрузки)
+          setTimeout(() => {
+            if (orderbookStore[data.pair]) {
+              const buy = orderbookToArray(orderbookStore[data.pair], "buy", 15);
+              const sell = orderbookToArray(orderbookStore[data.pair], "sell", 15);
+              ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
+              console.log(`Delayed orderBook sent to client for ${data.pair}`);
+            }
+          }, 2000);
         }
       }
     } catch (e) {
