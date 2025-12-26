@@ -47,14 +47,14 @@ function mapCandlesFromCoinbase(arr){
 
 function createEmptyOrderbook(){ return { bids: new Map(), asks: new Map() }; }
 
-function orderbookToArray(ob, side, limit = 20){
-  // Преобразуем Map в массив и сортируем
+function orderbookToArray(ob, side, limit = 15){
+  // Превращаем Map в массив
   const arr = [...(side === "buy" ? ob.bids : ob.asks).entries()]
     .map(([price,size])=>({price:Number(price),size:Number(size)}));
   
-  // Bids (Покупатели): хотят купить дешевле -> сортируем по убыванию цены (сверху самые дорогие заявки)
-  // Asks (Продавцы): хотят продать дороже -> сортируем по возрастанию цены (сверху самые дешевые заявки)
+  // Сортировка: Bids (покупатели) по убыванию, Asks (продавцы) по возрастанию
   arr.sort((a,b)=> side==="buy" ? b.price - a.price : a.price - b.price);
+  
   return arr.slice(0,limit);
 }
 
@@ -63,6 +63,7 @@ function broadcast(msg){
   const pair = msg.pair;
   wss.clients.forEach(ws=>{
     if (ws.readyState !== WebSocket.OPEN) return;
+    // Если клиент подписан на эту пару — отправляем
     if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
     ws.send(text);
   });
@@ -91,7 +92,6 @@ async function loadHistoryFor(product){
       console.error("Error fetching chunk:", e);
       break;
     }
-    
     fetched += chunk;
     await new Promise(r=>setTimeout(r,200));
   }
@@ -101,10 +101,9 @@ async function loadHistoryFor(product){
   console.log(`Loaded history for ${product}: ${candles.length}`);
 }
 
-// [НОВОЕ] Функция загрузки начального стакана через REST API
 async function loadOrderBookSnapshot(product) {
     console.log(`Fetching OrderBook Snapshot for ${product}...`);
-    // level=2 возвращает топ 50 бидов и асков
+    // Берем сразу level=2, чтобы получить основу
     const url = `${COINBASE_REST}/products/${product}/book?level=2`;
     
     try {
@@ -115,16 +114,13 @@ async function loadOrderBookSnapshot(product) {
         }
         const data = await r.json();
         
-        // Инициализируем хранилище, если нет
         if (!orderbookStore[product]) orderbookStore[product] = createEmptyOrderbook();
-        
         const ob = orderbookStore[product];
         
-        // Очищаем старые данные перед загрузкой снапшота
+        // Очищаем и заполняем заново
         ob.bids.clear();
         ob.asks.clear();
 
-        // data.bids и data.asks приходят в формате [ [price, size, num_orders], ... ]
         if (Array.isArray(data.bids)) {
             data.bids.forEach(bid => ob.bids.set(String(bid[0]), Number(bid[1])));
         }
@@ -132,7 +128,7 @@ async function loadOrderBookSnapshot(product) {
             data.asks.forEach(ask => ob.asks.set(String(ask[0]), Number(ask[1])));
         }
 
-        console.log(`Loaded OrderBook Snapshot for ${product}: ${ob.bids.size} bids, ${ob.asks.size} asks`);
+        console.log(`Snapshot loaded for ${product}: ${ob.bids.size} bids, ${ob.asks.size} asks`);
     } catch (e) {
         console.error(`Error loading snapshot for ${product}:`, e);
     }
@@ -145,11 +141,11 @@ function connectCoinbaseWS(){
   coinbaseWS = new WebSocket(COINBASE_WS);
 
   coinbaseWS.on("open",()=>{
-    console.log("Connected to Coinbase WS provider");
+    console.log("Connected to Coinbase WS");
     coinbaseWS.send(JSON.stringify({
       type:"subscribe",
       product_ids:PRODUCTS,
-      channels:["ticker", "level2", "matches"] // level2 шлет l2update
+      channels:["ticker", "level2", "matches"]
     }));
   });
 
@@ -190,11 +186,13 @@ function handleCoinbaseMessage(m){
         if (candles.length > HISTORY_CANDLES + 500) candles.shift();
       }
     }
+    // Тикер можно слать сразу, он не такой частый как стакан
     broadcast({ type:"price", pair, price, ts: Date.now() });
   }
 
-  // 2. Orderbook Update (l2update)
-  // Мы применяем изменения к уже загруженному через REST снапшоту
+  // 2. Orderbook Updates (ОБНОВЛЕНИЕ ПАМЯТИ)
+  // ВНИМАНИЕ: Здесь мы ТОЛЬКО обновляем память, но НЕ отправляем данные клиенту (Broadcast)
+  // Отправка будет происходить в отдельном интервале (см. ниже)
   if (m.type === "l2update"){
     if (!orderbookStore[pair]) orderbookStore[pair] = createEmptyOrderbook();
     const ob = orderbookStore[pair];
@@ -202,7 +200,7 @@ function handleCoinbaseMessage(m){
     if (m.changes){
       m.changes.forEach(([side, price, size]) => {
         const s = Number(size);
-        const p = String(price); // Ключи как строки для точности
+        const p = String(price); 
         
         if (side === "buy") {
             if (s === 0) ob.bids.delete(p);
@@ -213,18 +211,9 @@ function handleCoinbaseMessage(m){
         }
       });
     }
-
-    // Отправляем клиентам не каждое микро-обновление (слишком часто), 
-    // но в рамках этого примера шлем всё. В продакшене лучше делать throttle (раз в 100мс).
-    broadcast({
-      type:"orderBook",
-      pair,
-      buy: orderbookToArray(ob, "buy", 15), 
-      sell: orderbookToArray(ob, "sell", 15)
-    });
   }
 
-  // Обработка Snapshot от сокета (редкий случай, но бывает при реконнекте)
+  // Snapshot от сокета (редкость, но бывает)
   if (m.type === "snapshot") {
       if (!orderbookStore[pair]) orderbookStore[pair] = createEmptyOrderbook();
       const ob = orderbookStore[pair];
@@ -232,13 +221,6 @@ function handleCoinbaseMessage(m){
       ob.asks.clear();
       if (m.bids) m.bids.forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
       if (m.asks) m.asks.forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
-      
-      broadcast({
-        type:"orderBook",
-        pair,
-        buy: orderbookToArray(ob, "buy", 15), 
-        sell: orderbookToArray(ob, "sell", 15)
-      });
   }
 
   // 3. Trades
@@ -251,9 +233,29 @@ function handleCoinbaseMessage(m){
       time:new Date(m.time).getTime()
     });
     if (tradesStore[pair].length>100) tradesStore[pair].shift();
+    // Сделки тоже шлем сразу, они нужны для ленты
     broadcast({ type:"trades", pair, trades: tradesStore[pair].slice(-20) });
   }
 }
+
+/** ===== INTERVAL BROADCAST (THROTTLING) ===== */
+// [ВАЖНО] Отправляем стакан раз в 200мс, чтобы не "убить" браузер
+setInterval(() => {
+    PRODUCTS.forEach(pair => {
+        if (orderbookStore[pair]) {
+            const ob = orderbookStore[pair];
+            // Проверяем, есть ли данные вообще
+            if (ob.bids.size > 0 || ob.asks.size > 0) {
+                 broadcast({
+                    type: "orderBook",
+                    pair: pair,
+                    buy: orderbookToArray(ob, "buy", 15), 
+                    sell: orderbookToArray(ob, "sell", 15)
+                });
+            }
+        }
+    });
+}, 200); // 5 раз в секунду — более чем достаточно для глаз
 
 /** ===== WS SERVER ===== */
 wss.on('connection', (ws) => {
@@ -266,12 +268,12 @@ wss.on('connection', (ws) => {
             if (data.type === 'subscribe' && data.pair) {
                 ws.subscriptions.add(data.pair);
                 
-                // 1. Отправляем историю свечей
+                // 1. История
                 if (historyStore[data.pair]) {
                     ws.send(JSON.stringify({ type: 'history', pair: data.pair, data: historyStore[data.pair] }));
                 }
                 
-                // 2. ОТПРАВЛЯЕМ ТЕКУЩИЙ СТАКАН (Сразу при подключении!)
+                // 2. Текущий стакан (сразу)
                 if (orderbookStore[data.pair]) {
                     const ob = orderbookStore[data.pair];
                     ws.send(JSON.stringify({
@@ -282,12 +284,12 @@ wss.on('connection', (ws) => {
                     }));
                 }
 
-                // 3. Отправляем последние сделки
+                // 3. Сделки
                  if (tradesStore[data.pair]) {
                     ws.send(JSON.stringify({ type:"trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
                  }
                  
-                // 4. Отправляем текущую цену
+                // 4. Цена
                 if (latestPrice[data.pair]) {
                     ws.send(JSON.stringify({ type:"price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
                 }
@@ -303,14 +305,13 @@ wss.on('connection', (ws) => {
 });
 
 async function init(){
+  // Сначала загружаем данные, потом открываем сокет
   for (const p of PRODUCTS){
     historyStore[p]=[];
     orderbookStore[p]=createEmptyOrderbook();
-    
-    // Загружаем всё параллельно для скорости
     await Promise.all([
         loadHistoryFor(p),
-        loadOrderBookSnapshot(p) // <--- ВОТ ЭТО ГЛАВНОЕ ИСПРАВЛЕНИЕ
+        loadOrderBookSnapshot(p)
     ]);
   }
   
