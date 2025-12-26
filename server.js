@@ -14,272 +14,236 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// ——— CONFIG ———
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
 const COINBASE_REST = "https://api.exchange.coinbase.com";
 const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
-const HISTORY_CANDLES = 300; // Уменьшил для быстрого старта
+const HISTORY_CANDLES = 1440;
 const GRANULARITY = 60;
+const CHUNK_LIMIT = 300;
 
-// ——— STORAGE ———
+// =======================
+// ХРАНИЛИЩА
+// =======================
 const historyStore = {};
-const orderbookStore = {}; // { "BTC-USD": { bids: Map, asks: Map, sequence: 0 } }
-const latestPrice = {};
+const orderbookStore = {};
 const tradesStore = {};
+const latestPrice = {};
 
-// ——— UTILS ———
+const orderbookSeq = {};          // [FIX 1] sequence
+const lastOBHash = {};            // [FIX 4] diff-filter
 
-// Преобразуем Map в массив для клиента
-function orderbookToArray(map, limit = 15) {
-  // map: Map<priceString, sizeNumber>
-  // Сортируем: для bids (покупатели) от дорогого к дешевому, для asks (продавцы) от дешевого к дорогому
-  // Но здесь мы просто вернем массив, сортировку сделаем ниже, зная тип (bids/asks)
-  return [...map.entries()].map(([p, s]) => ({ price: Number(p), size: Number(s) }));
+// =======================
+// UTILS
+// =======================
+function mapCandlesFromCoinbase(arr){
+  if (!Array.isArray(arr)) return [];
+  const map = new Map();
+  for (const c of arr) {
+    const t = Math.floor(c[0]);
+    map.set(t, {
+      time: t,
+      open: Number(c[3]),
+      high: Number(c[2]),
+      low: Number(c[1]),
+      close: Number(c[4]),
+    });
+  }
+  return [...map.values()].sort((a,b)=>a.time - b.time);
 }
 
-function getFormattedOrderbook(pair) {
-    const ob = orderbookStore[pair];
-    if (!ob) return { buy: [], sell: [] };
-
-    // Bids: Сортировка по убыванию цены (кто платит больше - тот выше)
-    const buy = orderbookToArray(ob.bids).sort((a, b) => b.price - a.price).slice(0, 15);
-    
-    // Asks: Сортировка по возрастанию цены (кто продает дешевле - тот выше)
-    const sell = orderbookToArray(ob.asks).sort((a, b) => a.price - b.price).slice(0, 15);
-
-    return { buy, sell };
+function createEmptyOrderbook(){
+  return { bids: new Map(), asks: new Map() };
 }
 
-// Рассылка всем клиентам
-function broadcast(msg) {
-  const msgString = JSON.stringify(msg);
-  let count = 0;
-  wss.clients.forEach(client => {
-    // Проверяем, открыт ли сокет и подписан ли клиент на эту пару
-    if (client.readyState === WebSocket.OPEN && client.subscriptions && client.subscriptions.has(msg.pair)) {
-      client.send(msgString);
-      count++;
-    }
+function orderbookToArray(ob, side, limit = 15){
+  const arr = [...(side === "buy" ? ob.bids : ob.asks).entries()]
+    .map(([price,size])=>({price:Number(price),size:Number(size)}));
+
+  arr.sort((a,b)=> side==="buy" ? b.price - a.price : a.price - b.price);
+  return arr.slice(0,limit);
+}
+
+function hashOB(buy, sell){
+  return (
+    buy.map(l=>`${l.price}:${l.size}`).join("|") +
+    sell.map(l=>`${l.price}:${l.size}`).join("|")
+  );
+}
+
+function broadcast(msg){
+  const text = JSON.stringify(msg);
+  const pair = msg.pair;
+  wss.clients.forEach(ws=>{
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
+    ws.send(text);
   });
-  // Раскомментируй для отладки, если подозреваешь, что клиенты не получают данные:
-  // if (msg.type === "orderBook" && count > 0) console.log(`Sent OB update for ${msg.pair} to ${count} clients`);
 }
 
-// ——— COINBASE LOGIC ———
+// =======================
+// HISTORY + SNAPSHOT
+// =======================
+async function loadHistoryFor(product){
+  const now = Math.floor(Date.now()/1000);
+  let raw = [];
+  let fetched = 0;
 
-// 1. Загрузка Snapshot (Базовый слепок стакана)
-async function loadSnapshot(product) {
-  console.log(`[${product}] Fetching snapshot via REST...`);
-  try {
-    const r = await fetch(`${COINBASE_REST}/products/${product}/book?level=2`);
-    if (!r.ok) throw new Error(r.statusText);
-    const data = await r.json();
+  while (fetched < HISTORY_CANDLES){
+    const to = now - fetched*GRANULARITY;
+    const from = to - CHUNK_LIMIT*GRANULARITY;
+    const url = `${COINBASE_REST}/products/${product}/candles?granularity=${GRANULARITY}&start=${new Date(from*1000).toISOString()}&end=${new Date(to*1000).toISOString()}`;
+    const r = await fetch(url);
+    if (!r.ok) break;
+    raw.push(...await r.json());
+    fetched += CHUNK_LIMIT;
+    await new Promise(r=>setTimeout(r,200));
+  }
 
-    const bids = new Map();
-    const asks = new Map();
+  historyStore[product] = mapCandlesFromCoinbase(raw).slice(-HISTORY_CANDLES);
+}
 
-    data.bids.forEach(([p, s]) => bids.set(p, Number(s)));
-    data.asks.forEach(([p, s]) => asks.set(p, Number(s)));
+async function loadOrderBookSnapshot(product){
+  const url = `${COINBASE_REST}/products/${product}/book?level=2`;
+  const r = await fetch(url);
+  if (!r.ok) return;
 
-    orderbookStore[product] = { 
-        bids, 
-        asks, 
-        sequence: data.sequence // Важно сохранить sequence снапшота
-    };
-    console.log(`[${product}] Snapshot loaded. Sequence: ${data.sequence}`);
-  } catch (e) {
-    console.error(`[${product}] Snapshot failed:`, e.message);
+  const data = await r.json();
+  const ob = createEmptyOrderbook();
+
+  // [FIX 5] Ограничиваем глубину
+  data.bids.slice(0,500).forEach(([p,s])=>ob.bids.set(String(p),Number(s)));
+  data.asks.slice(0,500).forEach(([p,s])=>ob.asks.set(String(p),Number(s)));
+
+  orderbookStore[product] = ob;
+  orderbookSeq[product] = data.sequence || 0;
+}
+
+// =======================
+// COINBASE WS
+// =======================
+let coinbaseWS;
+
+function connectCoinbaseWS(){
+  coinbaseWS = new WebSocket(COINBASE_WS);
+
+  coinbaseWS.on("open",()=>{
+    coinbaseWS.send(JSON.stringify({
+      type:"subscribe",
+      product_ids:PRODUCTS,
+      channels:["ticker","level2","matches"]
+    }));
+  });
+
+  coinbaseWS.on("message",raw=>{
+    handleCoinbaseMessage(JSON.parse(raw.toString()));
+  });
+
+  coinbaseWS.on("close",()=>setTimeout(connectCoinbaseWS,5000));
+}
+
+async function handleCoinbaseMessage(m){
+  const pair = m.product_id;
+  if (!pair) return;
+
+  // PRICE
+  if (m.type==="ticker"){
+    latestPrice[pair] = Number(m.price);
+    broadcast({ type:"price", pair, price:latestPrice[pair], ts:Date.now() });
+  }
+
+  // ORDERBOOK UPDATE
+  if (m.type==="l2update"){
+    if (!orderbookStore[pair]) return;
+
+    // [FIX 1+2] sequence check
+    if (m.sequence <= orderbookSeq[pair]) return;
+    if (m.sequence !== orderbookSeq[pair] + 1){
+      await loadOrderBookSnapshot(pair);
+      return;
+    }
+    orderbookSeq[pair] = m.sequence;
+
+    const ob = orderbookStore[pair];
+    m.changes.forEach(([side,price,size])=>{
+      const p = String(price);
+      const s = Number(size);
+      if (side==="buy"){
+        s===0 ? ob.bids.delete(p) : ob.bids.set(p,s);
+      } else {
+        s===0 ? ob.asks.delete(p) : ob.asks.set(p,s);
+      }
+    });
+  }
+
+  // TRADES
+  if (m.type==="match"){
+    if (!tradesStore[pair]) tradesStore[pair]=[];
+    tradesStore[pair].push({
+      price:Number(m.price),
+      size:Number(m.size),
+      side:m.side,
+      time:new Date(m.time).getTime()
+    });
+    if (tradesStore[pair].length>100) tradesStore[pair].shift();
+    broadcast({ type:"trades", pair, trades: tradesStore[pair].slice(-20) });
   }
 }
 
-// 2. Подключение к WebSocket Coinbase
-let cbWs = null;
-let pingInterval = null;
+// =======================
+// ORDERBOOK BROADCAST (200ms)
+// =======================
+setInterval(()=>{
+  PRODUCTS.forEach(pair=>{
+    const ob = orderbookStore[pair];
+    if (!ob) return;
 
-function connectCoinbase() {
-  if (cbWs) cbWs.terminate();
-  
-  console.log("Connecting to Coinbase WS...");
-  cbWs = new WebSocket(COINBASE_WS);
+    const buy = orderbookToArray(ob,"buy",15);
+    const sell = orderbookToArray(ob,"sell",15);
+    if (!buy.length && !sell.length) return;
 
-  cbWs.on('open', () => {
-    console.log("Coinbase WS Connected!");
-    const msg = {
-      type: "subscribe",
-      product_ids: PRODUCTS,
-      channels: ["level2", "ticker", "matches"] // level2 - это стакан
-    };
-    cbWs.send(JSON.stringify(msg));
+    const h = hashOB(buy,sell);
+    if (h === lastOBHash[pair]) return;   // [FIX 4]
+    lastOBHash[pair] = h;
 
-    // Пинг, чтобы соединение не рвалось
-    pingInterval = setInterval(() => {
-        if(cbWs.readyState === WebSocket.OPEN) cbWs.ping();
-    }, 10000);
+    broadcast({ type:"orderBook", pair, buy, sell });
   });
+},200);
 
-  cbWs.on('message', (raw) => {
-    try {
-      const msg = JSON.parse(raw);
-      handleCoinbaseMessage(msg);
-    } catch (e) {
-      console.error("Parse Error:", e);
+// =======================
+// WS SERVER
+// =======================
+wss.on("connection",ws=>{
+  ws.subscriptions = new Set();
+
+  ws.on("message",msg=>{
+    const data = JSON.parse(msg);
+    if (data.type==="subscribe"){
+      ws.subscriptions.add(data.pair);
+      if (historyStore[data.pair]) ws.send(JSON.stringify({ type:"history", pair:data.pair, data:historyStore[data.pair] }));
+      if (orderbookStore[data.pair]) ws.send(JSON.stringify({
+        type:"orderBook",
+        pair:data.pair,
+        buy:orderbookToArray(orderbookStore[data.pair],"buy",15),
+        sell:orderbookToArray(orderbookStore[data.pair],"sell",15)
+      }));
+      if (latestPrice[data.pair]) ws.send(JSON.stringify({ type:"price", pair:data.pair, price:latestPrice[data.pair], ts:Date.now() }));
     }
   });
-
-  cbWs.on('error', (e) => console.error("Coinbase WS Error:", e));
-  
-  cbWs.on('close', () => {
-    console.log("Coinbase WS Closed. Reconnecting in 3s...");
-    clearInterval(pingInterval);
-    setTimeout(connectCoinbase, 3000);
-  });
-}
-
-function handleCoinbaseMessage(msg) {
-    const pair = msg.product_id;
-    if (!pair) return;
-
-    // --- Обработка Ticker (Цена) ---
-    if (msg.type === 'ticker') {
-        const price = Number(msg.price);
-        latestPrice[pair] = price;
-        broadcast({ type: "price", pair, price });
-    }
-
-    // --- Обработка Trades (Сделки) ---
-    if (msg.type === 'match') {
-        if (!tradesStore[pair]) tradesStore[pair] = [];
-        const trade = {
-            price: Number(msg.price),
-            side: msg.side,
-            time: new Date(msg.time).getTime()
-        };
-        tradesStore[pair].push(trade);
-        if (tradesStore[pair].length > 50) tradesStore[pair].shift();
-        
-        broadcast({ type: "trades", pair, trades: [trade] }); // Шлем сразу сделку
-    }
-
-    // --- Обработка OrderBook (L2 Update) ---
-    if (msg.type === 'l2update') {
-        // ❌ Ошибка 1: Если снапшот еще не загрузился, мы не можем обновлять стакан
-        if (!orderbookStore[pair]) return;
-
-        const store = orderbookStore[pair];
-        const changes = msg.changes; // [ ["buy", "100.0", "1.5"], ... ]
-        
-        // ❌ Ошибка 2 (РЕШЕНО): Строгая проверка Sequence.
-        // Мы просто проверяем, что новый пакет новее того, что у нас есть.
-        // Если пакет пришел с sequence меньше текущего - это мусор/дубль.
-        // Если sequence прыгнул (потеряли пакет) - мы все равно применяем, чтобы стакан "жил".
-        
-        // Coinbase присылает события пачками. Sequence один на сообщение.
-        // Игнорируем проверку sequence для простоты, если хотим 100% движения, 
-        // но лучше проверить, чтобы не применять старые данные.
-        // if (msg.sequence <= store.sequence) return; 
-
-        store.sequence = msg.sequence; // Обновляем seq
-
-        changes.forEach(([side, priceStr, sizeStr]) => {
-            const size = Number(sizeStr);
-            const targetMap = (side === 'buy') ? store.bids : store.asks;
-
-            if (size === 0) {
-                targetMap.delete(priceStr);
-            } else {
-                targetMap.set(priceStr, size);
-            }
-        });
-        
-        // ВАЖНО: Мы НЕ отправляем broadcast здесь. 
-        // l2update прилетают сотнями в секунду. Если слать каждый раз - клиент умрет.
-        // Мы используем setInterval внизу файла.
-    }
-}
-
-// ——— SERVER INIT ———
-
-// 3. Рассылка стакана (Throttling)
-// Отправляем стакан каждые 200мс, а не на каждое изменение
-setInterval(() => {
-    PRODUCTS.forEach(pair => {
-        // Проверяем, изменился ли sequence с прошлой отправки, чтобы не спамить (опционально)
-        // Но проще слать всегда, если есть подписчики
-        const data = getFormattedOrderbook(pair);
-        if (data.buy.length > 0) {
-            broadcast({ type: "orderBook", pair, buy: data.buy, sell: data.sell });
-        }
-    });
-}, 200); // 5 раз в секунду
-
-// API для Init
-app.post("/api/init", (req, res) => {
-    // Мок юзера для теста
-    res.json({
-        ok: true,
-        user: { user_id: 123, balance: 10000, photo_url: "" },
-        positions: []
-    });
-});
-app.post("/api/order/open", (req, res) => res.json({ ok:true, position: req.body, newBalance: 9900 }));
-app.post("/api/order/close", (req, res) => res.json({ ok:true, newBalance: 10000 }));
-
-// WS Server Client Handling
-wss.on('connection', (ws) => {
-    ws.subscriptions = new Set(); // Храним подписки клиента
-
-    ws.on('message', (m) => {
-        try {
-            const data = JSON.parse(m);
-            if (data.type === "subscribe") {
-                const pair = data.pair;
-                console.log(`Client subscribed to ${pair}`);
-                ws.subscriptions.add(pair);
-
-                // 1. Сразу шлем текущую цену
-                if (latestPrice[pair]) {
-                    ws.send(JSON.stringify({ type: "price", pair, price: latestPrice[pair] }));
-                }
-                
-                // 2. Сразу шлем стакан, если есть
-                const ob = getFormattedOrderbook(pair);
-                if (ob.buy.length > 0) {
-                    ws.send(JSON.stringify({ type: "orderBook", pair, buy: ob.buy, sell: ob.sell }));
-                }
-
-                // 3. Шлем историю свечей (Mock loading для примера)
-                if(!historyStore[pair]) loadHistory(pair); // Загрузим если нет
-                else ws.send(JSON.stringify({ type: "history", pair, data: historyStore[pair] }));
-            }
-        } catch (e) { console.error(e); }
-    });
 });
 
-async function loadHistory(pair) {
-    // Простая загрузка свечей
-    try {
-        const url = `${COINBASE_REST}/products/${pair}/candles?granularity=${GRANULARITY}`;
-        const r = await fetch(url);
-        const data = await r.json();
-        const mapped = data.map(d => ({ time: d[0], open: d[3], high: d[2], low: d[1], close: d[4] })).reverse();
-        historyStore[pair] = mapped;
-        // Можно отправить всем, кто ждет, но в данном коде это происходит при подписке
-    } catch(e){}
+// =======================
+// INIT
+// =======================
+async function init(){
+  for (const p of PRODUCTS){
+    await Promise.all([
+      loadHistoryFor(p),
+      loadOrderBookSnapshot(p)
+    ]);
+  }
+  connectCoinbaseWS();
+  server.listen(process.env.PORT||3000);
 }
 
-async function start() {
-    console.log("Server Initializing...");
-    
-    // Сначала грузим снапшоты, чтобы стакан был готов до первого l2update
-    for (const p of PRODUCTS) {
-        await loadSnapshot(p);
-    }
-    
-    connectCoinbase();
-
-    const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-}
-
-start();
+init();
