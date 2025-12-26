@@ -260,9 +260,9 @@ setInterval(() => {
     const sell = orderbookToArray(ob, "sell", 15);
 
     const h = hashOB(buy, sell);
-    if (h === lastOBHash[pair]) {
-      return; // изменений нет
-    }
+    //if (h === lastOBHash[pair]) {
+      //return; // изменений нет
+    //}
 
     lastOBHash[pair] = h;
     console.log(`📤 Sending orderBook update for ${pair}: ${buy.length} bids, ${sell.length} asks`);
