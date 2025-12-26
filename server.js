@@ -1,6 +1,5 @@
 import dotenv from "dotenv";
 dotenv.config();
-
 import express from "express";
 import http from "http";
 import cors from "cors";
@@ -29,14 +28,13 @@ const historyStore = {};
 const orderbookStore = {};
 const tradesStore = {};
 const latestPrice = {};
-
-const orderbookSeq = {};          // [FIX 1] sequence
-const lastOBHash = {};            // [FIX 4] diff-filter
+const orderbookSeq = {};
+const lastOBHash = {};
 
 // =======================
 // UTILS
 // =======================
-function mapCandlesFromCoinbase(arr){
+function mapCandlesFromCoinbase(arr) {
   if (!Array.isArray(arr)) return [];
   const map = new Map();
   for (const c of arr) {
@@ -49,79 +47,94 @@ function mapCandlesFromCoinbase(arr){
       close: Number(c[4]),
     });
   }
-  return [...map.values()].sort((a,b)=>a.time - b.time);
+  return [...map.values()].sort((a, b) => a.time - b.time);
 }
 
-function createEmptyOrderbook(){
+function createEmptyOrderbook() {
   return { bids: new Map(), asks: new Map() };
 }
 
-function orderbookToArray(ob, side, limit = 15){
+function orderbookToArray(ob, side, limit = 15) {
   const arr = [...(side === "buy" ? ob.bids : ob.asks).entries()]
-    .map(([price,size])=>({price:Number(price),size:Number(size)}));
-
-  arr.sort((a,b)=> side==="buy" ? b.price - a.price : a.price - b.price);
-  return arr.slice(0,limit);
+    .map(([price, size]) => ({ price: Number(price), size: Number(size) }));
+  arr.sort((a, b) => (side === "buy" ? b.price - a.price : a.price - b.price));
+  return arr.slice(0, limit);
 }
 
-function hashOB(buy, sell){
+function hashOB(buy, sell) {
   return (
-    buy.map(l=>`${l.price}:${l.size}`).join("|") +
-    sell.map(l=>`${l.price}:${l.size}`).join("|")
+    buy.map(l => `${l.price}:${l.size}`).join("|") +
+    "|" +
+    sell.map(l => `${l.price}:${l.size}`).join("|")
   );
 }
 
-function broadcast(msg){
+function broadcast(msg) {
   const text = JSON.stringify(msg);
   const pair = msg.pair;
   let sentCount = 0;
-  wss.clients.forEach(ws=>{
+  wss.clients.forEach(ws => {
     if (ws.readyState !== WebSocket.OPEN) return;
     if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
     ws.send(text);
     sentCount++;
   });
   if (msg.type === "orderBook") {
-    console.log(`📶 orderBook broadcast sent to ${sentCount} clients`);
+    console.log(`📶 orderBook broadcast sent to ${sentCount} clients for ${pair}`);
   }
 }
 
 // =======================
 // HISTORY + SNAPSHOT
 // =======================
-async function loadHistoryFor(product){
-  const now = Math.floor(Date.now()/1000);
+async function loadHistoryFor(product) {
+  const now = Math.floor(Date.now() / 1000);
   let raw = [];
   let fetched = 0;
-
-  while (fetched < HISTORY_CANDLES){
-    const to = now - fetched*GRANULARITY;
-    const from = to - CHUNK_LIMIT*GRANULARITY;
-    const url = `${COINBASE_REST}/products/${product}/candles?granularity=${GRANULARITY}&start=${new Date(from*1000).toISOString()}&end=${new Date(to*1000).toISOString()}`;
-    const r = await fetch(url);
-    if (!r.ok) break;
-    raw.push(...await r.json());
-    fetched += CHUNK_LIMIT;
-    await new Promise(r=>setTimeout(r,200));
+  while (fetched < HISTORY_CANDLES) {
+    const to = now - fetched * GRANULARITY;
+    const from = to - CHUNK_LIMIT * GRANULARITY;
+    const url = `${COINBASE_REST}/products/${product}/candles?granularity=${GRANULARITY}&start=${new Date(from * 1000).toISOString()}&end=${new Date(to * 1000).toISOString()}`;
+    try {
+      const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
+      if (!r.ok) {
+        console.warn(`Failed to fetch candles for ${product}: ${r.status}`);
+        break;
+      }
+      const chunk = await r.json();
+      raw.push(...chunk);
+      fetched += CHUNK_LIMIT;
+      await new Promise(r => setTimeout(r, 250)); // уважение к rate limit
+    } catch (e) {
+      console.error(`Error fetching history for ${product}:`, e.message);
+      break;
+    }
   }
-
   historyStore[product] = mapCandlesFromCoinbase(raw).slice(-HISTORY_CANDLES);
 }
 
-async function loadOrderBookSnapshot(product){
+async function loadOrderBookSnapshot(product) {
   const url = `${COINBASE_REST}/products/${product}/book?level=2`;
-  const r = await fetch(url);
-  if (!r.ok) return;
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
+    if (!r.ok) {
+      console.warn(`Failed to fetch orderbook snapshot for ${product}: ${r.status}`);
+      return false;
+    }
+    const data = await r.json();
+    const ob = createEmptyOrderbook();
+    data.bids.slice(0, 500).forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
+    data.asks.slice(0, 500).forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
 
-  const data = await r.json();
-  const ob = createEmptyOrderbook();
-
-  // [FIX 5] Ограничиваем глубину
-  data.bids.slice(0,500).forEach(([p,s])=>ob.bids.set(String(p),Number(s)));
-  data.asks.slice(0,500).forEach(([p,s])=>ob.asks.set(String(p),Number(s)));
-
-  orderbookStore[product] = ob;
-  orderbookSeq[product] = data.sequence || 0;
+    orderbookStore[product] = ob;
+    orderbookSeq[product] = data.sequence || 0;
+    lastOBHash[product] = ""; // сбрасываем хэш, чтобы отправить свежий стакан
+    console.log(`✅ Orderbook snapshot loaded for ${product} (seq=${orderbookSeq[product]})`);
+    return true;
+  } catch (e) {
+    console.error(`Error loading snapshot for ${product}:`, e.message);
+    return false;
+  }
 }
 
 // =======================
@@ -129,129 +142,190 @@ async function loadOrderBookSnapshot(product){
 // =======================
 let coinbaseWS;
 
-function connectCoinbaseWS(){
+function connectCoinbaseWS() {
+  console.log("Connecting to Coinbase WebSocket...");
   coinbaseWS = new WebSocket(COINBASE_WS);
 
-  coinbaseWS.on("open",()=>{
+  coinbaseWS.on("open", () => {
+    console.log("Coinbase WS connected — subscribing to channels...");
     coinbaseWS.send(JSON.stringify({
-      type:"subscribe",
-      product_ids:PRODUCTS,
-      channels:["ticker","level2","matches"]
+      type: "subscribe",
+      product_ids: PRODUCTS,
+      channels: ["ticker", "level2", "matches"]
     }));
+
+    // Важно: перезагружаем снапшоты при каждом reconnect
+    PRODUCTS.forEach(p => loadOrderBookSnapshot(p));
   });
 
-  coinbaseWS.on("message",raw=>{
-    handleCoinbaseMessage(JSON.parse(raw.toString()));
+  coinbaseWS.on("message", raw => {
+    try {
+      const m = JSON.parse(raw.toString());
+      handleCoinbaseMessage(m);
+    } catch (e) {
+      console.error("Error parsing Coinbase message:", e);
+    }
   });
 
-  coinbaseWS.on("close",()=>setTimeout(connectCoinbaseWS,5000));
+  coinbaseWS.on("close", () => {
+    console.log("Coinbase WS closed — reconnecting in 5s...");
+    setTimeout(connectCoinbaseWS, 5000);
+  });
+
+  coinbaseWS.on("error", err => {
+    console.error("Coinbase WS error:", err.message);
+  });
 }
 
-async function handleCoinbaseMessage(m){
+async function handleCoinbaseMessage(m) {
   const pair = m.product_id;
-  if (!pair) return;
+  if (!PRODUCTS.includes(pair)) return;
 
-  // PRICE
-  if (m.type==="ticker"){
+  // PRICE (ticker)
+  if (m.type === "ticker") {
     latestPrice[pair] = Number(m.price);
-    broadcast({ type:"price", pair, price:latestPrice[pair], ts:Date.now() });
+    broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
+    return;
   }
 
-  // ORDERBOOK UPDATE
-  if (m.type==="l2update"){
-    if (!orderbookStore[pair]) return;
+  // TRADES (match)
+  if (m.type === "match") {
+    if (!tradesStore[pair]) tradesStore[pair] = [];
+    tradesStore[pair].push({
+      price: Number(m.price),
+      size: Number(m.size),
+      side: m.side,
+      time: new Date(m.time).getTime()
+    });
+    if (tradesStore[pair].length > 100) tradesStore[pair].shift();
+    broadcast({ type: "trades", pair, trades: tradesStore[pair].slice(-20) });
+    return;
+  }
 
-    // [FIX 1+2] sequence check
-    if (m.sequence <= orderbookSeq[pair]) return;
-    if (m.sequence !== orderbookSeq[pair] + 1){
+  // ORDERBOOK (l2update)
+  if (m.type === "l2update") {
+    console.log(`📩 l2update for ${pair}: seq=${m.sequence}, changes=${m.changes.length}`);
+
+    // Если нет стакана — сразу грузим снапшот
+    if (!orderbookStore[pair] || !orderbookSeq[pair]) {
+      console.log(`No orderbook yet for ${pair} — loading snapshot`);
       await loadOrderBookSnapshot(pair);
       return;
     }
-    orderbookSeq[pair] = m.sequence;
 
+    // Проверка последовательности
+    if (m.sequence <= orderbookSeq[pair]) {
+      console.log(`Ignoring old/out-of-order sequence ${m.sequence}`);
+      return;
+    }
+
+    if (m.sequence !== orderbookSeq[pair] + 1) {
+      console.log(`Sequence gap! Expected ${orderbookSeq[pair] + 1}, got ${m.sequence} — reloading snapshot`);
+      await loadOrderBookSnapshot(pair);
+      return;
+    }
+
+    // Применяем изменения
+    orderbookSeq[pair] = m.sequence;
     const ob = orderbookStore[pair];
-    m.changes.forEach(([side,price,size])=>{
+
+    m.changes.forEach(([side, price, size]) => {
       const p = String(price);
       const s = Number(size);
-      if (side==="buy"){
-        s===0 ? ob.bids.delete(p) : ob.bids.set(p,s);
+      if (side === "buy") {
+        if (s === 0) ob.bids.delete(p);
+        else ob.bids.set(p, s);
       } else {
-        s===0 ? ob.asks.delete(p) : ob.asks.set(p,s);
+        if (s === 0) ob.asks.delete(p);
+        else ob.asks.set(p, s);
       }
     });
-  }
 
-  // TRADES
-  if (m.type==="match"){
-    if (!tradesStore[pair]) tradesStore[pair]=[];
-    tradesStore[pair].push({
-      price:Number(m.price),
-      size:Number(m.size),
-      side:m.side,
-      time:new Date(m.time).getTime()
-    });
-    if (tradesStore[pair].length>100) tradesStore[pair].shift();
-    broadcast({ type:"trades", pair, trades: tradesStore[pair].slice(-20) });
+    console.log(`Applied ${m.changes.length} changes to ${pair}`);
   }
 }
 
 // =======================
-// ORDERBOOK BROADCAST (200ms)
+// ORDERBOOK BROADCAST (каждые 200ms)
 // =======================
-setInterval(()=>{
-  PRODUCTS.forEach(pair=>{
+setInterval(() => {
+  PRODUCTS.forEach(pair => {
     const ob = orderbookStore[pair];
     if (!ob) {
-      console.log(`⚠️ No orderbook for ${pair}`);
+      // console.log(`No orderbook for ${pair}`);
       return;
     }
-    const buy = orderbookToArray(ob,"buy",15);
-    const sell = orderbookToArray(ob,"sell",15);
-    const h = hashOB(buy,sell);
+
+    const buy = orderbookToArray(ob, "buy", 15);
+    const sell = orderbookToArray(ob, "sell", 15);
+
+    const h = hashOB(buy, sell);
     if (h === lastOBHash[pair]) {
-      // console.log(`No changes in ${pair} orderbook`);
-      return;
+      return; // изменений нет
     }
+
     lastOBHash[pair] = h;
     console.log(`📤 Sending orderBook update for ${pair}: ${buy.length} bids, ${sell.length} asks`);
-    broadcast({ type:"orderBook", pair, buy, sell });
+    broadcast({ type: "orderBook", pair, buy, sell });
   });
-},200);
+}, 200);
 
 // =======================
-// WS SERVER
+// CLIENT WS SERVER
 // =======================
-wss.on("connection",ws=>{
+wss.on("connection", ws => {
   ws.subscriptions = new Set();
 
-  ws.on("message",msg=>{
-    const data = JSON.parse(msg);
-    if (data.type==="subscribe"){
-      ws.subscriptions.add(data.pair);
-      if (historyStore[data.pair]) ws.send(JSON.stringify({ type:"history", pair:data.pair, data:historyStore[data.pair] }));
-      if (orderbookStore[data.pair]) ws.send(JSON.stringify({
-        type:"orderBook",
-        pair:data.pair,
-        buy:orderbookToArray(orderbookStore[data.pair],"buy",15),
-        sell:orderbookToArray(orderbookStore[data.pair],"sell",15)
-      }));
-      if (latestPrice[data.pair]) ws.send(JSON.stringify({ type:"price", pair:data.pair, price:latestPrice[data.pair], ts:Date.now() }));
+  ws.on("message", raw => {
+    try {
+      const data = JSON.parse(raw.toString());
+      if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
+        ws.subscriptions.add(data.pair);
+        console.log(`Client subscribed to ${data.pair}`);
+
+        // Отправляем историю
+        if (historyStore[data.pair]) {
+          ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
+        }
+
+        // Отправляем текущую цену
+        if (latestPrice[data.pair]) {
+          ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
+        }
+
+        // Отправляем текущий стакан
+        if (orderbookStore[data.pair]) {
+          const buy = orderbookToArray(orderbookStore[data.pair], "buy", 15);
+          const sell = orderbookToArray(orderbookStore[data.pair], "sell", 15);
+          ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
+        }
+      }
+    } catch (e) {
+      console.error("Error handling client message:", e);
     }
+  });
+
+  ws.on("close", () => {
+    console.log("Client disconnected");
   });
 });
 
 // =======================
 // INIT
 // =======================
-async function init(){
-  for (const p of PRODUCTS){
+async function init() {
+  console.log("Initializing TradeSim server...");
+  for (const p of PRODUCTS) {
     await Promise.all([
       loadHistoryFor(p),
       loadOrderBookSnapshot(p)
     ]);
   }
   connectCoinbaseWS();
-  server.listen(process.env.PORT||3000);
+  const port = process.env.PORT || 3000;
+  server.listen(port, () => {
+    console.log(`🚀 Server running on port ${port}`);
+  });
 }
 
 init();
