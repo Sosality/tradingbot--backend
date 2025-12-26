@@ -47,9 +47,12 @@ function mapCandlesFromCoinbase(arr){
 
 function createEmptyOrderbook(){ return { bids: new Map(), asks: new Map() }; }
 
-function orderbookToArray(ob, side, limit = 50){
+function orderbookToArray(ob, side, limit = 20){
   const arr = [...(side === "buy" ? ob.bids : ob.asks).entries()]
     .map(([price,size])=>({price:Number(price),size:Number(size)}));
+  
+  // Bids: убывание (сверху самая высокая цена покупки)
+  // Asks: возрастание (сверху самая низкая цена продажи)
   arr.sort((a,b)=> side==="buy" ? b.price-a.price : a.price-b.price);
   return arr.slice(0,limit);
 }
@@ -59,7 +62,6 @@ function broadcast(msg){
   const pair = msg.pair;
   wss.clients.forEach(ws=>{
     if (ws.readyState !== WebSocket.OPEN) return;
-    // Если клиент подписан на пару, отправляем ему данные
     if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
     ws.send(text);
   });
@@ -126,82 +128,68 @@ function connectCoinbaseWS(){
   coinbaseWS.on("error",(e)=>console.error("Coinbase WS error:", e));
 }
 
-// === ГЛАВНАЯ ЛОГИКА ОБНОВЛЕНИЯ ===
 function handleCoinbaseMessage(m){
   const pair = m.product_id;
   if (!pair) return;
 
-  // 1. Ticker / Price update
+  // 1. Ticker
   if (m.type==="ticker"){
     const price = Number(m.price);
     latestPrice[pair] = price;
 
-    // --- ФИКС: ОБНОВЛЯЕМ ИСТОРИЮ НА СЕРВЕРЕ ---
     if (historyStore[pair] && historyStore[pair].length > 0) {
       const candles = historyStore[pair];
       const lastCandle = candles[candles.length - 1];
-      
       const now = Math.floor(Date.now() / 1000);
       const currentMinute = now - (now % 60);
 
       if (lastCandle.time === currentMinute) {
-        // Обновляем текущую свечу
         lastCandle.close = price;
         if (price > lastCandle.high) lastCandle.high = price;
         if (price < lastCandle.low) lastCandle.low = price;
       } else if (currentMinute > lastCandle.time) {
-        // Создаем новую свечу
-        const newCandle = {
-          time: currentMinute,
-          open: lastCandle.close, // continuity
-          high: price,
-          low: price,
-          close: price
-        };
-        candles.push(newCandle);
-
-        // Ограничиваем размер истории, чтобы память не текла
-        if (candles.length > HISTORY_CANDLES + 500) {
-          candles.shift();
-        }
+        candles.push({ time: currentMinute, open: lastCandle.close, high: price, low: price, close: price });
+        if (candles.length > HISTORY_CANDLES + 500) candles.shift();
       }
     }
-    // ------------------------------------------
-
     broadcast({ type:"price", pair, price, ts: Date.now() });
   }
 
-  // 2. Orderbook update
+  // 2. Orderbook
   if (m.type==="l2update" || m.type==="snapshot"){
     if (!orderbookStore[pair]) orderbookStore[pair]=createEmptyOrderbook();
     const ob = orderbookStore[pair];
 
-    (m.bids||[]).forEach(([p,s])=>{
-      s==0 ? ob.bids.delete(p) : ob.bids.set(p,Number(s));
-    });
-    (m.asks||[]).forEach(([p,s])=>{
-      s==0 ? ob.asks.delete(p) : ob.asks.set(p,Number(s));
-    });
+    const updateMap = (side, arr) => {
+        arr.forEach(([p,s])=>{
+            const price = String(p); // ключи мапы строками для точности
+            const size = Number(s);
+            if (size === 0) side.delete(price);
+            else side.set(price, size);
+        });
+    };
 
+    if (m.bids) updateMap(ob.bids, m.bids);
+    if (m.asks) updateMap(ob.asks, m.asks);
+    
     if (m.changes){
       m.changes.forEach(([side,price,size])=>{
         const s = Number(size);
-        if (side=="buy") s==0?ob.bids.delete(price):ob.bids.set(price,s);
-        else s==0?ob.asks.delete(price):ob.asks.set(price,s);
+        const p = String(price);
+        if (side==="buy") s===0 ? ob.bids.delete(p) : ob.bids.set(p,s);
+        else s===0 ? ob.asks.delete(p) : ob.asks.set(p,s);
       });
     }
 
-    // Для экономии трафика можно броадкастить orderbook реже, 
-    // но пока оставим как есть для плавности
     broadcast({
       type:"orderBook",
       pair,
-      buy:orderbookToArray(ob,"buy",20), // шлем только топ-20
-      sell:orderbookToArray(ob,"sell",20)
+      buy:orderbookToArray(ob,"buy", 15), 
+      sell:orderbookToArray(ob,"sell", 15)
     });
   }
 
-  // 3. Trades update
+  // 3. Trades
   if (m.type==="match" || m.type==="matches"){
     if (!tradesStore[pair]) tradesStore[pair]=[];
     tradesStore[pair].push({
@@ -210,16 +198,14 @@ function handleCoinbaseMessage(m){
       side:m.side,
       time:new Date(m.time).getTime()
     });
-
-    if (tradesStore[pair].length>100) tradesStore[pair].shift(); // храним меньше
+    if (tradesStore[pair].length>100) tradesStore[pair].shift();
     broadcast({ type:"trades", pair, trades: tradesStore[pair].slice(-20) });
   }
 }
 
-/** ===== WS CONNECTION HANDLING ===== */
-// Обработка подключений клиентов
+/** ===== WS SERVER ===== */
 wss.on('connection', (ws) => {
-    ws.subscriptions = new Set(); // Храним подписки клиента
+    ws.subscriptions = new Set();
 
     ws.on('message', (message) => {
         try {
@@ -228,34 +214,37 @@ wss.on('connection', (ws) => {
             if (data.type === 'subscribe' && data.pair) {
                 ws.subscriptions.add(data.pair);
                 
-                // Сразу отправляем историю
+                // 1. Отправляем историю
                 if (historyStore[data.pair]) {
-                    ws.send(JSON.stringify({
-                        type: 'history',
-                        pair: data.pair,
-                        data: historyStore[data.pair]
-                    }));
+                    ws.send(JSON.stringify({ type: 'history', pair: data.pair, data: historyStore[data.pair] }));
                 }
                 
-                // Сразу отправляем текущий стакан
-                /* Можно раскомментировать, если нужно мгновенное отображение стакана
+                // 2. ОТПРАВЛЯЕМ СТАКАН (Исправлено)
                 if (orderbookStore[data.pair]) {
-                   // логика отправки snapshot стакана
+                    const ob = orderbookStore[data.pair];
+                    ws.send(JSON.stringify({
+                        type: "orderBook",
+                        pair: data.pair,
+                        buy: orderbookToArray(ob, "buy", 15),
+                        sell: orderbookToArray(ob, "sell", 15)
+                    }));
                 }
-                */
+
+                // 3. Отправляем последние сделки
+                 if (tradesStore[data.pair]) {
+                    ws.send(JSON.stringify({ type:"trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
+                 }
             }
 
             if (data.type === 'unsubscribe' && data.pair) {
                 ws.subscriptions.delete(data.pair);
             }
-
         } catch (e) {
             console.error('Client msg error', e);
         }
     });
 });
 
-/** ===== INIT ===== */
 async function init(){
   for (const p of PRODUCTS){
     historyStore[p]=[];
@@ -263,11 +252,8 @@ async function init(){
     await loadHistoryFor(p);
   }
   connectCoinbaseWS();
-  
   const PORT = process.env.PORT || 3000;
-  server.listen(PORT,()=>{
-    console.log(`Server started on port ${PORT}`);
-  });
+  server.listen(PORT,()=>{ console.log(`Server started on port ${PORT}`); });
 }
 
 init();
