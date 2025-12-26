@@ -74,11 +74,16 @@ function hashOB(buy, sell){
 function broadcast(msg){
   const text = JSON.stringify(msg);
   const pair = msg.pair;
+  let sentCount = 0;
   wss.clients.forEach(ws=>{
     if (ws.readyState !== WebSocket.OPEN) return;
     if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
     ws.send(text);
+    sentCount++;
   });
+  if (msg.type === "orderBook") {
+    console.log(`📶 orderBook broadcast sent to ${sentCount} clients`);
+  }
 }
 
 // =======================
@@ -196,16 +201,19 @@ async function handleCoinbaseMessage(m){
 setInterval(()=>{
   PRODUCTS.forEach(pair=>{
     const ob = orderbookStore[pair];
-    if (!ob) return;
-
+    if (!ob) {
+      console.log(`⚠️ No orderbook for ${pair}`);
+      return;
+    }
     const buy = orderbookToArray(ob,"buy",15);
     const sell = orderbookToArray(ob,"sell",15);
-    if (!buy.length && !sell.length) return;
-
     const h = hashOB(buy,sell);
-    if (h === lastOBHash[pair]) return;   // [FIX 4]
+    if (h === lastOBHash[pair]) {
+      // console.log(`No changes in ${pair} orderbook`);
+      return;
+    }
     lastOBHash[pair] = h;
-
+    console.log(`📤 Sending orderBook update for ${pair}: ${buy.length} bids, ${sell.length} asks`);
     broadcast({ type:"orderBook", pair, buy, sell });
   });
 },200);
