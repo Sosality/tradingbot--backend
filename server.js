@@ -181,14 +181,14 @@ async function handleCoinbaseMessage(m) {
   const pair = m.product_id;
   if (!PRODUCTS.includes(pair)) return;
 
-  // PRICE (ticker)
+  // 1. ЦЕНА (TICKER)
   if (m.type === "ticker") {
     latestPrice[pair] = Number(m.price);
     broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
     return;
   }
 
-  // TRADES (match)
+  // 2. СДЕЛКИ (MATCH)
   if (m.type === "match") {
     if (!tradesStore[pair]) tradesStore[pair] = [];
     tradesStore[pair].push({
@@ -202,20 +202,18 @@ async function handleCoinbaseMessage(m) {
     return;
   }
 
-  // ORDERBOOK (l2update)
+  // 3. СТАКАН (L2UPDATE)
   if (m.type === "l2update") {
-    // console.log(`📩 l2update for ${pair}: seq=${m.sequence}, changes=${m.changes.length}`);
-
-    // Если нет стакана — сразу грузим снапшот
+    // Если стакана еще нет, пытаемся загрузить, но не блокируем поток
     if (!orderbookStore[pair]) {
-      // console.log(`No orderbook yet for ${pair} — loading snapshot`);
-      // Не блокируем (await) здесь, чтобы не стопорить обработку других пар
-      loadOrderBookSnapshot(pair); 
+      loadOrderBookSnapshot(pair);
       return;
     }
 
-    // [ИСПРАВЛЕНО] Просто игнорируем старые пакеты. 
-    // Убираем строгую проверку на +1, так как для L2 канала это может вызывать бесконечные релоады.
+    // ИСПРАВЛЕНИЕ:
+    // Мы просто игнорируем старые пакеты. 
+    // Если пришел пакет с номером больше текущего — принимаем его.
+    // Для канала 'level2' строгая проверка (seq + 1) не подходит и ломает логику.
     if (m.sequence <= orderbookSeq[pair]) {
       return;
     }
@@ -235,17 +233,15 @@ async function handleCoinbaseMessage(m) {
         else ob.asks.set(p, s);
       }
     });
-
-    // console.log(`Applied ${m.changes.length} changes to ${pair}`);
   }
   
-  // SNAPSHOT (иногда приходит по WS при старте)
+  // 4. СНАПШОТ (иногда приходит по WS)
   if (m.type === "snapshot") {
       const ob = createEmptyOrderbook();
       m.bids.forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
       m.asks.forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
       orderbookStore[pair] = ob;
-      orderbookSeq[pair] = -1; // Сброс sequence, чтобы принимать любые новые
+      orderbookSeq[pair] = -1; // Сброс sequence
       console.log(`WS Snapshot received for ${pair}`);
   }
 }
