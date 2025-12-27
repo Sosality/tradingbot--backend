@@ -204,24 +204,19 @@ async function handleCoinbaseMessage(m) {
 
   // ORDERBOOK (l2update)
   if (m.type === "l2update") {
-    console.log(`📩 l2update for ${pair}: seq=${m.sequence}, changes=${m.changes.length}`);
+    // console.log(`📩 l2update for ${pair}: seq=${m.sequence}, changes=${m.changes.length}`);
 
     // Если нет стакана — сразу грузим снапшот
-    if (!orderbookStore[pair] || !orderbookSeq[pair]) {
-      console.log(`No orderbook yet for ${pair} — loading snapshot`);
-      await loadOrderBookSnapshot(pair);
+    if (!orderbookStore[pair]) {
+      // console.log(`No orderbook yet for ${pair} — loading snapshot`);
+      // Не блокируем (await) здесь, чтобы не стопорить обработку других пар
+      loadOrderBookSnapshot(pair); 
       return;
     }
 
-    // Проверка последовательности
+    // [ИСПРАВЛЕНО] Просто игнорируем старые пакеты. 
+    // Убираем строгую проверку на +1, так как для L2 канала это может вызывать бесконечные релоады.
     if (m.sequence <= orderbookSeq[pair]) {
-      console.log(`Ignoring old/out-of-order sequence ${m.sequence}`);
-      return;
-    }
-
-    if (m.sequence !== orderbookSeq[pair] + 1) {
-      console.log(`Sequence gap! Expected ${orderbookSeq[pair] + 1}, got ${m.sequence} — reloading snapshot`);
-      await loadOrderBookSnapshot(pair);
       return;
     }
 
@@ -241,7 +236,17 @@ async function handleCoinbaseMessage(m) {
       }
     });
 
-    console.log(`Applied ${m.changes.length} changes to ${pair}`);
+    // console.log(`Applied ${m.changes.length} changes to ${pair}`);
+  }
+  
+  // SNAPSHOT (иногда приходит по WS при старте)
+  if (m.type === "snapshot") {
+      const ob = createEmptyOrderbook();
+      m.bids.forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
+      m.asks.forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
+      orderbookStore[pair] = ob;
+      orderbookSeq[pair] = -1; // Сброс sequence, чтобы принимать любые новые
+      console.log(`WS Snapshot received for ${pair}`);
   }
 }
 
