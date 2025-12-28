@@ -275,13 +275,6 @@ setInterval(() => {
     const buy = orderbookToArray(ob, "buy", 50);
     const sell = orderbookToArray(ob, "sell", 50);
 
-    const h = hashOB(buy, sell);
-    if (h === lastOBHash[pair]) {
-      // ничего не изменилось
-      return;
-    }
-    lastOBHash[pair] = h;
-
     // Отправляем как числа (price:number, size:number)
     broadcast({ type: "orderBook", pair, buy, sell, ts: Date.now() });
     console.log(`📤 Sending orderBook update for ${pair}: ${buy.length} bids, ${sell.length} asks`);
