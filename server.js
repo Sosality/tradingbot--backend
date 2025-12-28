@@ -195,18 +195,17 @@ function connectCoinbaseWS() {
   });
 }
 
+// ========== COINBASE WS MESSAGE HANDLER (заменить часть, отвечающую за l2update/snapshot) ==========
 async function handleCoinbaseMessage(m) {
   const pair = m.product_id;
   if (!PRODUCTS.includes(pair)) return;
 
-  // 1. ЦЕНА
   if (m.type === "ticker") {
     latestPrice[pair] = Number(m.price);
     broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
     return;
   }
 
-  // 2. СДЕЛКИ
   if (m.type === "match") {
     if (!tradesStore[pair]) tradesStore[pair] = [];
     tradesStore[pair].push({
@@ -220,8 +219,9 @@ async function handleCoinbaseMessage(m) {
     return;
   }
 
-  // 3. ORDERBOOK — L2UPDATE
+  // LEVEL2 UPDATE
   if (m.type === "l2update") {
+    // Если нет стакана — грузим snapshot
     if (!orderbookStore[pair]) {
       console.log(`No orderbook for ${pair} — loading snapshot`);
       await loadOrderBookSnapshot(pair);
@@ -230,33 +230,37 @@ async function handleCoinbaseMessage(m) {
 
     const ob = orderbookStore[pair];
 
-    m.changes.forEach(([side, price, size]) => {
-      const p = String(price);
-      const s = Number(size);
+    // Применяем изменения — НИКАК не записываем undefined в orderbookSeq
+    if (Array.isArray(m.changes)) {
+      m.changes.forEach(([side, price, size]) => {
+        const pkey = normalizePriceKey(price);
+        const s = Number(size);
+        if (side === "buy") {
+          if (s === 0) ob.bids.delete(pkey);
+          else ob.bids.set(pkey, s);
+        } else {
+          if (s === 0) ob.asks.delete(pkey);
+          else ob.asks.set(pkey, s);
+        }
+      });
+    }
 
-      if (side === "buy") {
-        if (s === 0) ob.bids.delete(p);
-        else ob.bids.set(p, s);
-      } else {
-        if (s === 0) ob.asks.delete(p);
-        else ob.asks.set(p, s);
-      }
-    });
-
-    // ❗ НЕ ТРОГАЕМ sequence
+    // Не меняем orderbookSeq тут (Coinbase l2update может не иметь sequence).
+    // Сбросим хэш, чтобы broadcast-таймер отправил обновление при следующей итерации:
     lastOBHash[pair] = "";
     return;
   }
 
-  // 4. СНАПШОТ (если вдруг придёт по WS)
+  // WS SNAPSHOT (редко)
   if (m.type === "snapshot") {
     const ob = createEmptyOrderbook();
-    m.bids.forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
-    m.asks.forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
+    if (Array.isArray(m.bids)) m.bids.forEach(([p, s]) => ob.bids.set(normalizePriceKey(p), Number(s)));
+    if (Array.isArray(m.asks)) m.asks.forEach(([p, s]) => ob.asks.set(normalizePriceKey(p), Number(s)));
     orderbookStore[pair] = ob;
-    orderbookSeq[pair] = -1;
+    orderbookSeq[pair] = typeof m.sequence === 'number' ? m.sequence : (orderbookSeq[pair] || -1);
     lastOBHash[pair] = "";
     console.log(`WS Snapshot received for ${pair}`);
+    return;
   }
 }
 
