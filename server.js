@@ -128,28 +128,31 @@ async function loadHistoryFor(product) {
   historyStore[product] = mapCandlesFromCoinbase(raw).slice(-HISTORY_CANDLES);
 }
 
+// ========== LOAD SNAPSHOT (заменить старую функцию loadOrderBookSnapshot) ==========
 async function loadOrderBookSnapshot(product) {
-  const url = `${COINBASE_REST}/products/${product}/book?level=2`;
-  try {
-    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
-    if (!r.ok) {
-      console.warn(`Failed to fetch orderbook snapshot for ${product}: ${r.status}`);
-      return false;
-    }
-    const data = await r.json();
-    const ob = createEmptyOrderbook();
-    data.bids.slice(0, 500).forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
-    data.asks.slice(0, 500).forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
+  const url = `${COINBASE_REST}/products/${product}/book?level=2`;
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
+    if (!r.ok) {
+      console.warn(`Failed to fetch orderbook snapshot for ${product}: ${r.status}`);
+      return false;
+    }
+    const data = await r.json();
+    const ob = createEmptyOrderbook();
+    // Нормализуем ключи цен
+    data.bids.slice(0, 2000).forEach(([p, s]) => ob.bids.set(normalizePriceKey(p), Number(s)));
+    data.asks.slice(0, 2000).forEach(([p, s]) => ob.asks.set(normalizePriceKey(p), Number(s)));
 
-    orderbookStore[product] = ob;
-    orderbookSeq[product] = data.sequence || 0;
-    lastOBHash[product] = ""; // сбрасываем хэш, чтобы отправить свежий стакан
-    console.log(`✅ Orderbook snapshot loaded for ${product} (seq=${orderbookSeq[product]})`);
-    return true;
-  } catch (e) {
-    console.error(`Error loading snapshot for ${product}:`, e.message);
-    return false;
-  }
+    orderbookStore[product] = ob;
+    // sequence устанавливаем только если есть число
+    orderbookSeq[product] = typeof data.sequence === 'number' ? data.sequence : (orderbookSeq[product] || 0);
+    lastOBHash[product] = ""; // сбрасываем хэш, чтобы отправить свежий стакан
+    console.log(`✅ Orderbook snapshot loaded for ${product} (seq=${orderbookSeq[product]})`);
+    return true;
+  } catch (e) {
+    console.error(`Error loading snapshot for ${product}:`, e.message);
+    return false;
+  }
 }
 
 // =======================
