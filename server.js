@@ -50,15 +50,30 @@ function mapCandlesFromCoinbase(arr) {
   return [...map.values()].sort((a, b) => a.time - b.time);
 }
 
+// ========== ORDERBOOK UTILS (заменить старые версии) ==========
 function createEmptyOrderbook() {
-  return { bids: new Map(), asks: new Map() };
+  return { bids: new Map(), asks: new Map() };
 }
 
+// Нормализуем цену в строковый ключ с 2 знаками после запятой (USD)
+function normalizePriceKey(price) {
+  // price может быть number или строкой — всегда приводим к Number и затем toFixed(2)
+  const n = Number(price);
+  if (!isFinite(n)) return String(price);
+  return n.toFixed(2);
+}
+
+// Возвращает массив уровней в виде { price: Number, size: Number }
+// side: "buy" или "sell"
 function orderbookToArray(ob, side, limit = 15) {
-  const arr = [...(side === "buy" ? ob.bids : ob.asks).entries()]
-    .map(([price, size]) => ({ price: Number(price), size: Number(size) }));
-  arr.sort((a, b) => (side === "buy" ? b.price - a.price : a.price - b.price));
-  return arr.slice(0, limit);
+  const map = side === "buy" ? ob.bids : ob.asks;
+  const arr = [...map.entries()].map(([priceK, size]) => {
+    return { price: Number(priceK), size: Number(size) };
+  });
+
+  // buy — от большого к малому, sell — от малого к большому
+  arr.sort((a, b) => (side === "buy" ? b.price - a.price : a.price - b.price));
+  return arr.slice(0, limit);
 }
 
 function hashOB(buy, sell) {
