@@ -178,72 +178,72 @@ function connectCoinbaseWS() {
 }
 
 async function handleCoinbaseMessage(m) {
-  const pair = m.product_id;
-  if (!PRODUCTS.includes(pair)) return;
+  const pair = m.product_id;
+  if (!PRODUCTS.includes(pair)) return;
 
-  // 1. ЦЕНА (TICKER)
-  if (m.type === "ticker") {
-    latestPrice[pair] = Number(m.price);
-    broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
-    return;
-  }
+  // 1. ЦЕНА
+  if (m.type === "ticker") {
+    latestPrice[pair] = Number(m.price);
+    broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
+    return;
+  }
 
-  // 2. СДЕЛКИ (MATCH)
-  if (m.type === "match") {
-    if (!tradesStore[pair]) tradesStore[pair] = [];
-    tradesStore[pair].push({
-      price: Number(m.price),
-      size: Number(m.size),
-      side: m.side,
-      time: new Date(m.time).getTime()
-    });
-    if (tradesStore[pair].length > 100) tradesStore[pair].shift();
-    broadcast({ type: "trades", pair, trades: tradesStore[pair].slice(-20) });
-    return;
-  }
+  // 2. СДЕЛКИ
+  if (m.type === "match") {
+    if (!tradesStore[pair]) tradesStore[pair] = [];
+    tradesStore[pair].push({
+      price: Number(m.price),
+      size: Number(m.size),
+      side: m.side,
+      time: new Date(m.time).getTime()
+    });
+    if (tradesStore[pair].length > 100) tradesStore[pair].shift();
+    broadcast({ type: "trades", pair, trades: tradesStore[pair].slice(-20) });
+    return;
+  }
 
-  // 3. СТАКАН (L2UPDATE)
-  if (m.type === "l2update") {
-    // Если стакана еще нет, пытаемся загрузить, но не блокируем поток
-    if (!orderbookStore[pair]) {
-      loadOrderBookSnapshot(pair);
-      return;
-    }
+  // 3. СТАКАН — L2UPDATE
+  if (m.type === "l2update") {
+    if (!orderbookStore[pair]) {
+      console.log(`No orderbook for ${pair} — loading snapshot`);
+      await loadOrderBookSnapshot(pair);
+      return;
+    }
 
-    // ИСПРАВЛЕНИЕ:
-    // Мы просто игнорируем старые пакеты. 
-    // Если пришел пакет с номером больше текущего — принимаем его.
-    // Для канала 'level2' строгая проверка (seq + 1) не подходит и ломает логику.
-    if (m.sequence <= orderbookSeq[pair]) {
-      return;
-    }
+    // Coinbase level2 часто присылает sequence с пропусками при reconnect
+    // Поэтому принимаем любой sequence > текущего
+    if (m.sequence <= orderbookSeq[pair]) return;
 
-    // Применяем изменения
-    orderbookSeq[pair] = m.sequence;
-    const ob = orderbookStore[pair];
+    orderbookSeq[pair] = m.sequence;
+    const ob = orderbookStore[pair];
 
-    m.changes.forEach(([side, price, size]) => {
-      const p = String(price);
-      const s = Number(size);
-      if (side === "buy") {
-        if (s === 0) ob.bids.delete(p);
-        else ob.bids.set(p, s);
-      } else {
-        if (s === 0) ob.asks.delete(p);
-        else ob.asks.set(p, s);
-      }
-    });
-  }
-  
-  // 4. СНАПШОТ (иногда приходит по WS)
-  if (m.type === "snapshot") {
-      const ob = createEmptyOrderbook();
-      m.bids.forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
-      m.asks.forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
-      orderbookStore[pair] = ob;
-      orderbookSeq[pair] = -1; // Сброс sequence
-      console.log(`WS Snapshot received for ${pair}`);
-  }
+    m.changes.forEach(([side, price, size]) => {
+      const p = String(price);
+      const s = Number(size);
+      if (side === "buy") {
+        if (s === 0) ob.bids.delete(p);
+        else ob.bids.set(p, s);
+      } else {
+        if (s === 0) ob.asks.delete(p);
+        else ob.asks.set(p, s);
+      }
+    });
+
+    // Сбрасываем хэш, чтобы гарантировать отправку обновления
+    lastOBHash[pair] = "";
+    return;
+  }
+
+  // 4. СНАПШОТ (если вдруг придёт по WS)
+  if (m.type === "snapshot") {
+    const ob = createEmptyOrderbook();
+    m.bids.forEach(([p, s]) => ob.bids.set(String(p), Number(s)));
+    m.asks.forEach(([p, s]) => ob.asks.set(String(p), Number(s)));
+    orderbookStore[pair] = ob;
+    orderbookSeq[pair] = -1;
+    lastOBHash[pair] = "";
+    console.log(`WS Snapshot received for ${pair}`);
+  }
 }
 
 // =======================
