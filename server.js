@@ -268,25 +268,24 @@ async function handleCoinbaseMessage(m) {
 // ORDERBOOK BROADCAST (каждые 200ms)
 // =======================
 setInterval(() => {
-  PRODUCTS.forEach(pair => {
-    const ob = orderbookStore[pair];
-    if (!ob) {
-      // console.log(`No orderbook for ${pair}`);
-      return;
-    }
+  PRODUCTS.forEach(pair => {
+    const ob = orderbookStore[pair];
+    if (!ob) return;
 
-    const buy = orderbookToArray(ob, "buy", 15);
-    const sell = orderbookToArray(ob, "sell", 15);
+    const buy = orderbookToArray(ob, "buy", 50);
+    const sell = orderbookToArray(ob, "sell", 50);
 
-    const h = hashOB(buy, sell);
-    //if (h === lastOBHash[pair]) {
-      //return; // изменений нет
-    //}
+    const h = hashOB(buy, sell);
+    if (h === lastOBHash[pair]) {
+      // ничего не изменилось
+      return;
+    }
+    lastOBHash[pair] = h;
 
-    lastOBHash[pair] = h;
-    console.log(`📤 Sending orderBook update for ${pair}: ${buy.length} bids, ${sell.length} asks`);
-    broadcast({ type: "orderBook", pair, buy, sell });
-  });
+    // Отправляем как числа (price:number, size:number)
+    broadcast({ type: "orderBook", pair, buy, sell, ts: Date.now() });
+    console.log(`📤 Sending orderBook update for ${pair}: ${buy.length} bids, ${sell.length} asks`);
+  });
 }, 200);
 
 // =======================
