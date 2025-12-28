@@ -202,7 +202,7 @@ async function handleCoinbaseMessage(m) {
     return;
   }
 
-  // 3. СТАКАН — L2UPDATE
+  // 3. ORDERBOOK — L2UPDATE
   if (m.type === "l2update") {
     if (!orderbookStore[pair]) {
       console.log(`No orderbook for ${pair} — loading snapshot`);
@@ -210,16 +210,12 @@ async function handleCoinbaseMessage(m) {
       return;
     }
 
-    // Coinbase level2 часто присылает sequence с пропусками при reconnect
-    // Поэтому принимаем любой sequence > текущего
-    if (m.sequence <= orderbookSeq[pair]) return;
-
-    orderbookSeq[pair] = m.sequence;
     const ob = orderbookStore[pair];
 
     m.changes.forEach(([side, price, size]) => {
       const p = String(price);
       const s = Number(size);
+
       if (side === "buy") {
         if (s === 0) ob.bids.delete(p);
         else ob.bids.set(p, s);
@@ -229,7 +225,7 @@ async function handleCoinbaseMessage(m) {
       }
     });
 
-    // Сбрасываем хэш, чтобы гарантировать отправку обновления
+    // ❗ НЕ ТРОГАЕМ sequence
     lastOBHash[pair] = "";
     return;
   }
