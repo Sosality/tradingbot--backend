@@ -292,50 +292,57 @@ setInterval(() => {
 // CLIENT WS SERVER
 // =======================
 wss.on("connection", ws => {
-  ws.subscriptions = new Set();
+  ws.subscriptions = new Set();
 
-  ws.on("message", async raw => {
-    try {
-      const data = JSON.parse(raw.toString());
-      if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
-        ws.subscriptions.add(data.pair);
-        console.log(`Client subscribed to ${data.pair}`);
+  ws.on("message", async raw => {
+    try {
+      const data = JSON.parse(raw.toString());
 
-        // Отправляем историю
-        if (historyStore[data.pair]) {
-          ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
-        }
+      // Subscribe
+      if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
+        ws.subscriptions.add(data.pair);
+        console.log(`Client subscribed to ${data.pair}`);
 
-        // Отправляем текущую цену
-        if (latestPrice[data.pair]) {
-          ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
-        }
+        if (historyStore[data.pair]) {
+          ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
+        }
+        if (latestPrice[data.pair]) {
+          ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
+        }
+        if (orderbookStore[data.pair]) {
+          const buy = orderbookToArray(orderbookStore[data.pair], "buy", 50);
+          const sell = orderbookToArray(orderbookStore[data.pair], "sell", 50);
+          ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
+        } else {
+          // подождём чуть-чуть, если snapshot грузится
+          setTimeout(() => {
+            if (orderbookStore[data.pair]) {
+              const buy = orderbookToArray(orderbookStore[data.pair], "buy", 50);
+              const sell = orderbookToArray(orderbookStore[data.pair], "sell", 50);
+              ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
+              console.log(`Delayed orderBook sent to client for ${data.pair}`);
+            }
+          }, 1500);
+        }
+        return;
+      }
 
-        // КРИТИЧНО: отправляем стакан, даже если он ещё не готов — или ждём его
-        if (orderbookStore[data.pair]) {
-          const buy = orderbookToArray(orderbookStore[data.pair], "buy", 15);
-          const sell = orderbookToArray(orderbookStore[data.pair], "sell", 15);
-          ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
-        } else {
-          // Если стакана нет — ждём 2 секунды и пробуем снова (снапшот может быть в процессе загрузки)
-          setTimeout(() => {
-            if (orderbookStore[data.pair]) {
-              const buy = orderbookToArray(orderbookStore[data.pair], "buy", 15);
-              const sell = orderbookToArray(orderbookStore[data.pair], "sell", 15);
-              ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy, sell }));
-              console.log(`Delayed orderBook sent to client for ${data.pair}`);
-            }
-          }, 2000);
-        }
-      }
-    } catch (e) {
-      console.error("Error handling client message:", e);
-    }
-  });
+      // Unsubscribe
+      if (data.type === "unsubscribe" && data.pair) {
+        if (ws.subscriptions.has(data.pair)) {
+          ws.subscriptions.delete(data.pair);
+          console.log(`Client unsubscribed from ${data.pair}`);
+        }
+        return;
+      }
+    } catch (e) {
+      console.error("Error handling client message:", e);
+    }
+  });
 
-  ws.on("close", () => {
-    console.log("Client disconnected");
-  });
+  ws.on("close", () => {
+    console.log("Client disconnected");
+  });
 });
 
 // =======================
