@@ -1,13 +1,13 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require("socket.io");
-const WebSocket = require('ws');
+import express from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import WebSocket from 'ws';
 
 const app = express();
-const server = http.createServer(app);
+const httpServer = createServer(app);
 
-// Настройка Socket.io с открытым CORS, чтобы ты мог открыть HTML файл прямо с рабочего стола
-const io = new Server(server, {
+// Настройка Socket.io с открытым CORS
+const io = new Server(httpServer, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
@@ -16,7 +16,7 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 
-// 1. Подключение к Binance (публичный стрим, BTC/USDT, стакан 10 уровней, обновление 100мс)
+// Binance WebSocket URL (BTC/USDT, depth 10, 100ms)
 const binanceUrl = 'wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms';
 let binanceSocket;
 
@@ -28,16 +28,18 @@ function connectBinance() {
     });
 
     binanceSocket.on('message', (data) => {
-        // Парсим сырые данные
-        const parsed = JSON.parse(data);
-        
-        // 2. Отправляем на фронтенд
-        // Добавляем serverTime, чтобы замерять задержку
-        io.emit('orderbook', {
-            bids: parsed.bids,
-            asks: parsed.asks,
-            serverTime: Date.now()
-        });
+        try {
+            const parsed = JSON.parse(data);
+            
+            // Отправляем данные клиенту
+            io.emit('orderbook', {
+                bids: parsed.bids,
+                asks: parsed.asks,
+                serverTime: Date.now()
+            });
+        } catch (e) {
+            console.error('Parse error:', e);
+        }
     });
 
     binanceSocket.on('close', () => {
@@ -50,17 +52,18 @@ function connectBinance() {
     });
 }
 
+// Запускаем подключение
 connectBinance();
 
-// Простой роут для проверки жизни сервера
+// Простой роут для проверки
 app.get('/', (req, res) => {
-    res.send('TradingBot Backend is running. Connect via Socket.io');
+    res.send('TradingBot Backend (Binance) is running.');
 });
 
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
 });
 
-server.listen(PORT, () => {
+httpServer.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
