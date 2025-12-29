@@ -22,8 +22,8 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 // =======================
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
 
-const COINBASE_REST = "https://api.exchange.coinbase.com";
-const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
+// Binance
+const BINANCE_REST = "https://api.binance.com";
 const BINANCE_WS = "wss://stream.binance.com:9443/ws";
 
 // соответствие символов
