@@ -17,7 +17,7 @@ const io = new Server(httpServer, {
 const PORT = process.env.PORT || 3000;
 
 // Binance WebSocket URL (BTC/USDT, depth 10, 100ms)
-const binanceUrl = 'wss://stream.binance.vision:9443/ws/btcusdt@depth10@100ms';
+const binanceUrl = 'wss://stream.binance.us:9443/ws/btcusdt@depth10@100ms';
 let binanceSocket;
 
 function connectBinance() {
