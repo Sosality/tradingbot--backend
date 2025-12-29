@@ -16,12 +16,11 @@ const wss = new WebSocketServer({ server });
 // Настройки продуктов
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
 
-// Coinbase Settings (для Истории, Тикера и Сделок)
+// Coinbase Settings (ТОЛЬКО для загрузки истории свечей REST)
 const COINBASE_REST = "https://api.exchange.coinbase.com";
-const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
-// Binance Settings (ТОЛЬКО для Стакана/OrderBook)
-const BINANCE_WS_BASE = "wss://stream.binance.us:9443/stream?streams="; // Используем stream для мульти-пар
+// Binance Settings (Стакан + Цена + Сделки)
+const BINANCE_WS_BASE = "wss://stream.binance.us:9443/stream?streams=";
 
 const HISTORY_CANDLES = 1440;
 const GRANULARITY = 60;
@@ -31,7 +30,7 @@ const CHUNK_LIMIT = 300;
 // ХРАНИЛИЩА
 // =======================
 const historyStore = {};
-const orderbookStore = {}; // Теперь здесь храним готовые массивы от Binance
+const orderbookStore = {}; 
 const tradesStore = {};
 const latestPrice = {};
 
@@ -40,16 +39,14 @@ const latestPrice = {};
 // =======================
 
 // Карта соответствия имен: Coinbase <-> Binance
-// Coinbase: "BTC-USD", Binance: "btcusdt"
 function getBinanceSymbol(product) {
-  return product.replace("-", "").toLowerCase() + "t"; // костыль для usdt: BTC-USD -> btcusdt
+  return product.replace("-", "").toLowerCase() + "t"; // BTC-USD -> btcusdt
 }
 
 function getCoinbaseSymbol(binanceStreamName) {
-  // binanceStreamName пример: "btcusdt@depth20@100ms"
+  // binanceStreamName может быть "btcusdt@depth20", "btcusdt@trade" и т.д.
   const symbol = binanceStreamName.split("@")[0];
   const raw = symbol.toUpperCase().replace("USDT", "-USD"); // btcusdt -> BTC-USD
-  // Если у вас будут пары не только к USD, тут нужна логика сложнее, но для BTC/ETH подойдет
   return raw; 
 }
 
@@ -69,9 +66,8 @@ function mapCandlesFromCoinbase(arr) {
   return [...map.values()].sort((a, b) => a.time - b.time);
 }
 
-// Форматирование данных от Binance в формат вашего приложения
+// Форматирование стакана от Binance
 function formatBinanceOrderBook(bids, asks) {
-  // Binance шлет строки ["20000.00", "0.5"], нам нужны числа { price, size }
   const format = (arr) => arr.map(([p, s]) => ({ price: Number(p), size: Number(s) }));
   return {
     buy: format(bids),
@@ -92,6 +88,7 @@ function broadcast(msg) {
 // =======================
 // HISTORY (COINBASE REST)
 // =======================
+// Мы оставили Coinbase только для этого — загрузить график при старте
 async function loadHistoryFor(product) {
   const now = Math.floor(Date.now() / 1000);
   let raw = [];
@@ -120,36 +117,73 @@ async function loadHistoryFor(product) {
 }
 
 // =======================
-// BINANCE WS (ORDER BOOK)
+// BINANCE WS (EVERYTHING REALTIME)
 // =======================
 let binanceWS;
 
 function connectBinanceWS() {
-  // Формируем URL для подписки сразу на все пары
-  // Пример: stream?streams=btcusdt@depth20@100ms/ethusdt@depth20@100ms
-  const streams = PRODUCTS.map(p => `${getBinanceSymbol(p)}@depth20@100ms`).join("/");
+  // Подписываемся на:
+  // 1. depth20@100ms (Стакан)
+  // 2. trade (Сделки в реальном времени)
+  // 3. ticker (Текущая цена 24ч)
+  const streams = PRODUCTS.map(p => {
+    const sym = getBinanceSymbol(p);
+    return `${sym}@depth20@100ms/${sym}@trade/${sym}@ticker`;
+  }).join("/");
+  
   const url = `${BINANCE_WS_BASE}${streams}`;
 
-  console.log(`Connecting to Binance WS for OrderBook... (${url})`);
+  console.log(`Connecting to Binance WS...`);
   binanceWS = new WebSocket(url);
 
   binanceWS.on("open", () => {
-    console.log("✅ Binance WS connected (Order Books)");
+    console.log("✅ Binance WS connected (OrderBook, Price, Trades)");
   });
 
   binanceWS.on("message", raw => {
     try {
       const msg = JSON.parse(raw.toString());
-      // Формат Combined Stream: { stream: "btcusdt@depth20@100ms", data: { lastUpdateId, bids, asks } }
-      if (msg.data && msg.stream) {
-        const pair = getCoinbaseSymbol(msg.stream);
-        
-        // Преобразуем сразу в нужный формат и сохраняем
+      if (!msg.data || !msg.stream) return;
+
+      const pair = getCoinbaseSymbol(msg.stream); // Получаем BTC-USD
+      const streamType = msg.stream.split("@")[1]; // depth20, trade, ticker
+
+      // --- 1. ОБРАБОТКА СТАКАНА (OrderBook) ---
+      if (streamType.startsWith("depth")) {
         orderbookStore[pair] = formatBinanceOrderBook(msg.data.bids, msg.data.asks);
-        
-        // Тут мы НЕ делаем broadcast сразу, так как у вас есть отдельный интервал для этого (внизу),
-        // чтобы не спамить клиентов каждые 100мс, если не нужно.
+        // Не отправляем broadcast здесь, это делает setInterval ниже
       }
+
+      // --- 2. ОБРАБОТКА ЦЕНЫ (Ticker) ---
+      else if (streamType === "ticker") {
+        const newPrice = Number(msg.data.c); // 'c' - current close price
+        latestPrice[pair] = newPrice;
+        
+        // Отправляем клиенту обновление цены сразу
+        broadcast({ type: "price", pair, price: newPrice, ts: Date.now() });
+      }
+
+      // --- 3. ОБРАБОТКА СДЕЛОК (Trades) ---
+      else if (streamType === "trade") {
+        if (!tradesStore[pair]) tradesStore[pair] = [];
+        
+        // Binance trade format: { p: price, q: quantity, T: timestamp, m: isBuyerMaker }
+        // Если isBuyerMaker = true, значит мейкер (тот кто поставил лимитку) был покупателем -> значит это продажа (Sell) по рынку
+        const side = msg.data.m ? "sell" : "buy"; 
+        
+        tradesStore[pair].push({
+          price: Number(msg.data.p),
+          size: Number(msg.data.q),
+          side: side,
+          time: msg.data.T
+        });
+
+        if (tradesStore[pair].length > 100) tradesStore[pair].shift();
+        
+        // Отправляем клиенту последние сделки
+        broadcast({ type: "trades", pair, trades: tradesStore[pair].slice(-20) });
+      }
+
     } catch (e) {
       console.error("Error parsing Binance message:", e);
     }
@@ -166,76 +200,14 @@ function connectBinanceWS() {
 }
 
 // =======================
-// COINBASE WS (TICKER + TRADES)
-// =======================
-let coinbaseWS;
-
-function connectCoinbaseWS() {
-  console.log("Connecting to Coinbase WS for Ticker/Trades...");
-  coinbaseWS = new WebSocket(COINBASE_WS);
-
-  coinbaseWS.on("open", () => {
-    console.log("✅ Coinbase WS connected — subscribing...");
-    coinbaseWS.send(JSON.stringify({
-      type: "subscribe",
-      product_ids: PRODUCTS,
-      channels: ["ticker", "matches"] // УБРАЛИ "level2", так как стакан теперь от Binance
-    }));
-  });
-
-  coinbaseWS.on("message", raw => {
-    try {
-      const m = JSON.parse(raw.toString());
-      handleCoinbaseMessage(m);
-    } catch (e) {
-      console.error("Error parsing Coinbase message:", e);
-    }
-  });
-
-  coinbaseWS.on("close", () => {
-    console.log("Coinbase WS closed — reconnecting in 5s...");
-    setTimeout(connectCoinbaseWS, 5000);
-  });
-}
-
-function handleCoinbaseMessage(m) {
-  const pair = m.product_id;
-  if (!PRODUCTS.includes(pair)) return;
-
-  // TICKER
-  if (m.type === "ticker") {
-    latestPrice[pair] = Number(m.price);
-    broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
-    return;
-  }
-
-  // TRADES
-  if (m.type === "match") {
-    if (!tradesStore[pair]) tradesStore[pair] = [];
-    tradesStore[pair].push({
-      price: Number(m.price),
-      size: Number(m.size),
-      side: m.side,
-      time: new Date(m.time).getTime()
-    });
-    if (tradesStore[pair].length > 100) tradesStore[pair].shift();
-    
-    // Broadcast trades immediately
-    broadcast({ type: "trades", pair, trades: tradesStore[pair].slice(-20) });
-    return;
-  }
-}
-
-// =======================
 // ORDERBOOK BROADCAST LOOP
 // =======================
-// Отправляем клиентам данные стакана (которые теперь обновляются от Binance)
+// Отправляем стакан каждые 200мс, чтобы не спамить
 setInterval(() => {
   PRODUCTS.forEach(pair => {
     const ob = orderbookStore[pair];
-    if (!ob) return; // Данных от Binance еще нет
+    if (!ob) return; 
 
-    // ob уже содержит { buy: [], sell: [] } в нужном формате
     broadcast({ 
       type: "orderBook", 
       pair, 
@@ -243,11 +215,8 @@ setInterval(() => {
       sell: ob.sell, 
       ts: Date.now() 
     });
-    
-    // Log для отладки (можно закомментировать, чтобы не спамило в консоль)
-    // console.log(`📤 Sent OB for ${pair} (Bids: ${ob.buy.length}, Asks: ${ob.sell.length})`);
   });
-}, 200); // 200ms троттлинг для клиентов
+}, 200);
 
 // =======================
 // CLIENT WS SERVER
@@ -264,13 +233,15 @@ wss.on("connection", ws => {
         ws.subscriptions.add(data.pair);
         console.log(`Client subscribed to ${data.pair}`);
 
-        // Send Initial Data
+        // 1. History (Coinbase)
         if (historyStore[data.pair]) {
           ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
         }
+        // 2. Latest Price (Binance)
         if (latestPrice[data.pair]) {
           ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
         }
+        // 3. Order Book (Binance)
         if (orderbookStore[data.pair]) {
           const ob = orderbookStore[data.pair];
           ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, buy: ob.buy, sell: ob.sell }));
@@ -282,7 +253,6 @@ wss.on("connection", ws => {
       if (data.type === "unsubscribe" && data.pair) {
         if (ws.subscriptions.has(data.pair)) {
           ws.subscriptions.delete(data.pair);
-          console.log(`Client unsubscribed from ${data.pair}`);
         }
         return;
       }
@@ -290,26 +260,21 @@ wss.on("connection", ws => {
       console.error("Error handling client message:", e);
     }
   });
-
-  ws.on("close", () => {
-    // console.log("Client disconnected");
-  });
 });
 
 // =======================
 // INIT
 // =======================
 async function init() {
-  console.log("Initializing Hybrid Server (Base: Coinbase, OB: Binance)...");
+  console.log("Initializing Unified Server (Base: Coinbase History, Realtime: Binance)...");
   
-  // 1. Грузим историю (Coinbase REST)
+  // 1. Грузим историю свечей (Coinbase REST) - нужно только 1 раз при старте
   for (const p of PRODUCTS) {
     await loadHistoryFor(p);
   }
 
-  // 2. Подключаем сокеты
-  connectCoinbaseWS(); // Для цены и сделок
-  connectBinanceWS();  // Для стакана
+  // 2. Подключаем Binance для ВСЕГО остального (Цена, Стакан, Сделки)
+  connectBinanceWS();
 
   const port = process.env.PORT || 3000;
   server.listen(port, () => {
