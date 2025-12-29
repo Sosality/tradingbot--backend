@@ -5,6 +5,7 @@ import http from "http";
 import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
 app.use(cors());
@@ -13,26 +14,21 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// === НАСТРОЙКИ ===
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
-
-// Coinbase только для истории
 const COINBASE_REST = "https://api.exchange.coinbase.com";
-
-// Глобальный Binance (здесь самая высокая активность в мире)
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 
-const HISTORY_CANDLES = 1440;
-const GRANULARITY = 60;
-const CHUNK_LIMIT = 300;
+// ТВОИ ДАННЫЕ ПРОКСИ (Нидерланды)
+const PROXY_URL = "http://admin0IA2s:dyLHVHsepX@45.10.156.225:59100";
+const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 const historyStore = {};
 const orderbookStore = {};
 const tradesStore = {}; 
 const latestPrice = {};
 
-// === UTILS ===
-
-// Превращаем BTC-USD в btcusdt (для глобального Binance)
+// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getBinanceSymbol(product) {
   return product.replace("-", "").toLowerCase() + "t"; 
 }
@@ -40,17 +36,6 @@ function getBinanceSymbol(product) {
 function getCoinbaseSymbol(binanceStreamName) {
   const symbol = binanceStreamName.split("@")[0];
   return symbol.toUpperCase().replace("USDT", "-USD");
-}
-
-function mapCandlesFromCoinbase(arr) {
-  if (!Array.isArray(arr)) return [];
-  return arr.map(c => ({
-    time: Math.floor(c[0]),
-    open: Number(c[3]),
-    high: Number(c[2]),
-    low: Number(c[1]),
-    close: Number(c[4]),
-  })).sort((a, b) => a.time - b.time);
 }
 
 function formatBinanceOrderBook(bids, asks) {
@@ -69,37 +54,39 @@ function broadcast(msg) {
   });
 }
 
-// === 1. HISTORY (COINBASE REST) ===
+// === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
 async function loadHistoryFor(product) {
-  const now = Math.floor(Date.now() / 1000);
-  let raw = [];
   try {
-    const url = `${COINBASE_REST}/products/${product}/candles?granularity=${GRANULARITY}`;
+    const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
     const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
-    if (r.ok) {
-      const chunk = await r.json();
-      raw = chunk;
-    }
-  } catch (e) {
-    console.error(`Error history ${product}:`, e.message);
-  }
-  historyStore[product] = mapCandlesFromCoinbase(raw).slice(-HISTORY_CANDLES);
+    if (!r.ok) return;
+    const chunk = await r.json();
+    historyStore[product] = chunk.map(c => ({
+      time: Math.floor(c[0]),
+      open: Number(c[3]),
+      high: Number(c[2]),
+      low: Number(c[1]),
+      close: Number(c[4]),
+    })).sort((a, b) => a.time - b.time).slice(-1440);
+    console.log(`✅ История ${product} загружена`);
+  } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
 }
 
-// === 2. BINANCE WEBSOCKET (ГЛОБАЛЬНЫЙ) ===
+// === 2. ПОДКЛЮЧЕНИЕ К BINANCE ЧЕРЕЗ ПРОКСИ ===
 let binanceWS;
 
 function connectBinanceWS() {
-  // Агрегированные сделки (aggTrade) — самый быстрый способ получать реальные продажи/покупки
   const streams = PRODUCTS.map(p => {
     const sym = getBinanceSymbol(p);
     return `${sym}@depth20@100ms/${sym}@aggTrade/${sym}@ticker`;
   }).join("/");
 
-  const url = `${BINANCE_WS_BASE}${streams}`;
-  console.log("Connecting to Global Binance...");
+  console.log("🌐 Подключение к Binance Global через прокси (NL)...");
   
-  binanceWS = new WebSocket(url);
+  // Передаем proxyAgent для обхода блокировки 451
+  binanceWS = new WebSocket(BINANCE_WS_BASE + streams, { agent: proxyAgent });
+
+  binanceWS.on("open", () => console.log("✅ Соединение с Binance через прокси установлено!"));
 
   binanceWS.on("message", raw => {
     try {
@@ -109,41 +96,42 @@ function connectBinanceWS() {
       const pair = getCoinbaseSymbol(msg.stream);
       const streamName = msg.stream.split("@")[1];
 
-      // СТАКАН
+      // 1. Стакан
       if (streamName.startsWith("depth")) {
         orderbookStore[pair] = formatBinanceOrderBook(msg.data.bids, msg.data.asks);
-      }
-
-      // ЦЕНА (летает очень быстро)
+      } 
+      // 2. Живая цена
       else if (streamName === "ticker") {
         latestPrice[pair] = Number(msg.data.c);
         broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
       }
-
-      // СДЕЛКИ (теперь их будет очень много)
+      // 3. Последние сделки (Trades)
       else if (streamName === "aggTrade") {
         if (!tradesStore[pair]) tradesStore[pair] = [];
-        
         const trade = {
           price: Number(msg.data.p),
           size: Number(msg.data.q),
           side: msg.data.m ? "sell" : "buy",
           time: msg.data.T
         };
-
         tradesStore[pair].push(trade);
         if (tradesStore[pair].length > 50) tradesStore[pair].shift();
-        
-        // Отправляем массив из одной сделки (как ждет клиент)
         broadcast({ type: "trades", pair, trades: [trade] });
       }
     } catch (e) { console.error("Parse error:", e); }
   });
 
-  binanceWS.on("close", () => setTimeout(connectBinanceWS, 2000));
+  binanceWS.on("error", err => {
+    console.error("❌ Ошибка сокета/прокси:", err.message);
+  });
+
+  binanceWS.on("close", () => {
+    console.log("Binance WS закрыт. Реконнект через 5 сек...");
+    setTimeout(connectBinanceWS, 5000);
+  });
 }
 
-// Рассылка стакана 5 раз в секунду
+// Рассылка стакана (5 раз в секунду)
 setInterval(() => {
   PRODUCTS.forEach(pair => {
     if (orderbookStore[pair]) {
@@ -152,7 +140,7 @@ setInterval(() => {
   });
 }, 200);
 
-// === 3. CLIENT WS SERVER ===
+// === 3. СЕРВЕР ДЛЯ КЛИЕНТОВ (FRONTEND) ===
 wss.on("connection", ws => {
   ws.subscriptions = new Set();
   ws.on("message", raw => {
@@ -161,9 +149,11 @@ wss.on("connection", ws => {
       if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
         ws.subscriptions.add(data.pair);
         
+        // Отправляем начальные данные сразу после подписки
         if (historyStore[data.pair]) ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
         if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
         if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
+        // Отправляем историю сделок, чтобы поле Last Trades не было пустым
         if (tradesStore[data.pair]) ws.send(JSON.stringify({ type: "trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
       }
     } catch (e) { console.error(e); }
@@ -173,7 +163,8 @@ wss.on("connection", ws => {
 async function init() {
   for (const p of PRODUCTS) await loadHistoryFor(p);
   connectBinanceWS();
-  server.listen(process.env.PORT || 3000, () => console.log(`🚀 Live Server on port 3000`));
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => console.log(`🚀 Сервер запущен на порту ${PORT}`));
 }
 
 init();
