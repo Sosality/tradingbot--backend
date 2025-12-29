@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>OrderBook Debug</title>
+<style>
+  body {
+    background:#0b0e11;
+    color:#eaecef;
+    font-family: monospace;
+    margin:0;
+    padding:12px;
+  }
+  h2 { margin: 8px 0; }
+  .row { display:flex; gap:20px; }
+  pre {
+    background:#111;
+    padding:10px;
+    border:1px solid #333;
+    max-height:400px;
+    overflow:auto;
+    font-size:12px;
+  }
+  .green { color:#0ecb81 }
+  .red { color:#f6465d }
+</style>
+</head>
+<body>
+
+<h2>WS OrderBook Debug</h2>
+
+<div>Status: <span id="status">connecting...</span></div>
+<div>Pair:
+  <select id="pair">
+    <option value="BTC-USD">BTC-USD</option>
+    <option value="ETH-USD">ETH-USD</option>
+  </select>
+</div>
+
+<div>Price: <span id="price">—</span></div>
+<div>OrderBook updates: <span id="obCount">0</span></div>
+
+<hr />
+
+<div class="row">
+  <div>
+    <h3>ASKS (top 10)</h3>
+    <pre id="asks"></pre>
+  </div>
+  <div>
+    <h3>BIDS (top 10)</h3>
+    <pre id="bids"></pre>
+  </div>
+</div>
+
+<script>
+const WS_URL = "wss://tradingbot-backend-2yws.onrender.com";
+
+let socket;
+let pair = "BTC-USD";
+let obUpdates = 0;
+
+const elStatus = document.getElementById('status');
+const elPrice = document.getElementById('price');
+const elAsks = document.getElementById('asks');
+const elBids = document.getElementById('bids');
+const elCount = document.getElementById('obCount');
+const pairSelect = document.getElementById('pair');
+
+function connect() {
+  socket = new WebSocket(WS_URL);
+
+  socket.onopen = () => {
+    elStatus.textContent = "CONNECTED";
+    socket.send(JSON.stringify({ type: "subscribe", pair }));
+  };
+
+  socket.onclose = () => {
+    elStatus.textContent = "DISCONNECTED — reconnecting...";
+    setTimeout(connect, 2000);
+  };
+
+  socket.onerror = () => {
+    elStatus.textContent = "ERROR";
+  };
+
+  socket.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); }
+    catch { return; }
+
+    if (msg.type === "price" && msg.pair === pair) {
+      elPrice.textContent = msg.price;
+    }
+
+    if (msg.type === "orderBook" && msg.pair === pair) {
+      obUpdates++;
+      elCount.textContent = obUpdates;
+
+      elAsks.textContent = (msg.sell || []).slice(0,10)
+        .map(l => `${l.price}  |  ${l.size}`).join("\n");
+
+      elBids.textContent = (msg.buy || []).slice(0,10)
+        .map(l => `${l.price}  |  ${l.size}`).join("\n");
+    }
+  };
+}
+
+pairSelect.onchange = () => {
+  pair = pairSelect.value;
+  obUpdates = 0;
+  elCount.textContent = "0";
+  elAsks.textContent = "";
+  elBids.textContent = "";
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "subscribe", pair }));
+  }
+};
+
+connect();
+</script>
+
+</body>
+</html>
