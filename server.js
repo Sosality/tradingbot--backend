@@ -72,17 +72,44 @@ function broadcast(msg) {
   });
 }
 
-// === TELEGRAM ALERT ===
+// === TELEGRAM ALERT (УЛУЧШЕННАЯ ВЕРСИЯ) ===
 async function sendTelegramAlert(userId, message) {
-    if (!BOT_TOKEN || !userId) return;
+    if (!BOT_TOKEN || !userId) {
+        console.error("⚠️ TG Alert skipped: No Token or User ID");
+        return;
+    }
+    
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        await fetch(url, {
+        
+        // Добавляем await, чтобы мы точно дождались ответа
+        const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: userId, text: message, parse_mode: 'HTML' })
+            body: JSON.stringify({ 
+                chat_id: userId, 
+                text: message, 
+                parse_mode: 'HTML' 
+            })
         });
-    } catch (e) { console.error("TG Error:", e.message); }
+
+        // Пытаемся распарсить ответ
+        const data = await response.json();
+
+        if (!data.ok) {
+            // Если Telegram вернул ошибку (например, 400 или 403)
+            console.error(`❌ TELEGRAM API ERROR for User ${userId}:`);
+            console.error(`   Error Code: ${data.error_code}`);
+            console.error(`   Description: ${data.description}`);
+        } else {
+            // Успешная отправка
+            console.log(`✅ Message sent to ${userId}. Message ID: ${data.result.message_id}`);
+        }
+
+    } catch (e) {
+        // Ошибка сети или самого fetch
+        console.error("❌ NETWORK/FETCH ERROR:", e.message);
+    }
 }
 
 let isProcessing = false;
