@@ -7,6 +7,7 @@ import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { Pool } from "pg"; // БД для ликвидаций
+import cron from "node-cron";
 
 const app = express();
 app.use(cors());
