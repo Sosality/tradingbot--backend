@@ -78,20 +78,30 @@ async function sendTelegramAlert(userId, message) {
     } catch (e) { console.error("TG Error:", e.message); }
 }
 
-// === 🔥 ДВИЖОК ЛИКВИДАЦИИ (ОБНОВЛЕННАЯ ЛОГИКА) 🔥 ===
+let isProcessing = false;
+
+// === 🔥 LIQUIDATION ENGINE (UPDATED) 🔥 ===
 async function checkLiquidations() {
-    if (Object.keys(latestPrice).length === 0) return;
+    // Если предыдущая проверка еще идет или нет цен — пропускаем такт
+    if (isProcessing || Object.keys(latestPrice).length === 0) return;
+    
+    isProcessing = true; // Блокируем вход
 
     try {
         const res = await db.query(`SELECT * FROM positions`);
-        if (res.rows.length === 0) return;
+        
+        // Если позиций нет, сразу выходим
+        if (res.rows.length === 0) {
+            isProcessing = false;
+            return;
+        }
 
         for (const pos of res.rows) {
             const currentPrice = latestPrice[pos.pair];
             if (!currentPrice) continue;
 
             const entry = Number(pos.entry_price);
-            const size = Number(pos.size); // ОБЪЕМ (Margin * Leverage)
+            const size = Number(pos.size); // Объем позиции (Margin * Leverage)
             const margin = Number(pos.margin);
             
             // 1. Считаем PnL
@@ -104,39 +114,54 @@ async function checkLiquidations() {
                 pnl = -diff * size;
             }
 
-            // 2. Расчет безопасности (Safety Checks)
-            // Комиссия за закрытие (0.03% от ОБЪЕМА)
+            // 2. Расчет порогов безопасности
+            // Комиссия за закрытие (например, 0.03%)
             const closeCommission = size * 0.0003; 
-            
-            // Поддерживающая маржа (0.4% от ОБЪЕМА) - буфер безопасности
-            // Чем больше плечо, тем больше объем, тем больше этот буфер.
+            // Поддерживающая маржа (например, 0.4% от объема)
             const maintenanceMargin = size * 0.004; 
 
-            // Сколько денег осталось в сделке
+            // Сколько денег осталось у пользователя в сделке
             const remainingEquity = margin + pnl;
 
-            // Порог ликвидации:
-            // Ликвидируем, если оставшихся денег не хватает, чтобы покрыть комиссию + поддерживающую маржу
+            // Порог ликвидации (нужно оставить хотя бы на комиссию и поддержку)
             const liquidationThreshold = closeCommission + maintenanceMargin;
 
             // === 3. ПРОВЕРКА НА ЛИКВИДАЦИЮ ===
             if (remainingEquity <= liquidationThreshold) {
-                console.log(`💀 LIQUIDATION: User ${pos.user_id} | Pair ${pos.pair} | Size ${size} | Equity ${remainingEquity.toFixed(2)} <= Threshold ${liquidationThreshold.toFixed(2)}`);
-                await executeLiquidation(pos, currentPrice, size, -margin); // PnL при ликвидации = минус вся маржа
-                continue; // переходим к следующей, чтобы не слать алерт на уже удаленную
+                console.log(`💀 LIQUIDATING: User ${pos.user_id} | ${pos.pair}`);
+                // PnL при ликвидации равен минус маржа (пользователь теряет всё)
+                await executeLiquidation(pos, currentPrice, size, -margin);
+                continue; 
             }
 
-            // === 4. ПРОВЕРКА MARGIN CALL (ПРЕДУПРЕЖДЕНИЕ) ===
-            // Предупреждаем, если осталось мало до порога (например, 1.5x от порога ликвидации)
-            if (!pos.warning_sent && remainingEquity <= (liquidationThreshold * 1.5)) {
-                const msg = `⚠️ <b>MARGIN CALL</b> ⚠️\n\nПозиция <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) в опасности!\n\n📉 Остаток маржи: ${remainingEquity.toFixed(2)} VP\n💀 Порог ликвидации: ${liquidationThreshold.toFixed(2)} VP\n\nСистема ликвидирует позицию заранее, чтобы покрыть комиссии.`;
-                sendTelegramAlert(pos.user_id, msg);
-                // Ставим флаг, чтобы не спамить
+            // === 4. MARGIN CALL (ENGLISH WARNING) ===
+            // Предупреждаем, если Equity опустилось близко к порогу (например, запас < 20% от порога)
+            // Логика: Если осталось денег меньше, чем 1.2 * порог смерти, шлем алерт
+            const warningThreshold = liquidationThreshold * 1.2; 
+
+            if (!pos.warning_sent && remainingEquity <= warningThreshold) {
+                const pnlFormatted = pnl.toFixed(2);
+                
+                const msg = `⚠️ <b>MARGIN CALL WARNING</b> ⚠️\n\n` +
+                            `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n\n` +
+                            `📉 PnL: ${pnlFormatted} VP\n` +
+                            `💰 Remaining Equity: ${remainingEquity.toFixed(2)} VP\n` +
+                            `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
+                            `System will auto-liquidate if equity drops further.`;
+
+                // Отправляем сообщение
+                await sendTelegramAlert(pos.user_id, msg);
+                
+                // Ставим флаг в БД, чтобы не отправлять сообщение повторно
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
+                
+                console.log(`⚠️ Warning sent to user ${pos.user_id}`);
             }
         }
     } catch (e) {
         console.error("Liquidation Loop Error:", e.message);
+    } finally {
+        isProcessing = false; // Разблокируем вход
     }
 }
 
@@ -145,19 +170,24 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     try {
         await client.query("BEGIN");
 
-        // При ликвидации комиссия = 0 (она "съедена" буфером внутри маржи)
-        // PnL = -Margin (пользователь теряет всё, что вложил в сделку)
+        // 1. Записываем в историю сделок
         await client.query(`
             INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue, 0]);
 
+        // 2. Удаляем позицию из активных
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
 
         await client.query("COMMIT");
         
-        // Уведомление о факте смерти
-        sendTelegramAlert(pos.user_id, `⛔️ <b>LIQUIDATED</b>\n\nВаша позиция ${pos.pair} была ликвидирована.\nУбыток: ${pnlValue} VP`);
+        // 3. Уведомление о ликвидации (Тоже на английском)
+        const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
+                    `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
+                    `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
+                    `Price reached liquidation level.`;
+                    
+        sendTelegramAlert(pos.user_id, msg);
 
     } catch (e) {
         await client.query("ROLLBACK");
