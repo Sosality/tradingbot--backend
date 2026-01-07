@@ -13,6 +13,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// === 🔥 ДОБАВЛЯЕМ HEALTH CHECK ROUTE 🔥 ===
+// Это endpoint, который будет дергать второй сервер, чтобы проверить, что этот жив
+app.get("/health", (req, res) => {
+    res.status(200).send("Im Alive");
+});
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
