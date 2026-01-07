@@ -108,9 +108,9 @@ async function checkLiquidations() {
             // Комиссия за закрытие (0.03% от ОБЪЕМА)
             const closeCommission = size * 0.0003; 
             
-            // Поддерживающая маржа (0.5% от ОБЪЕМА) - буфер безопасности
+            // Поддерживающая маржа (0.4% от ОБЪЕМА) - буфер безопасности
             // Чем больше плечо, тем больше объем, тем больше этот буфер.
-            const maintenanceMargin = size * 0.005; 
+            const maintenanceMargin = size * 0.004; 
 
             // Сколько денег осталось в сделке
             const remainingEquity = margin + pnl;
