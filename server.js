@@ -20,7 +20,7 @@ const COINBASE_REST = "https://api.exchange.coinbase.com";
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 
 // ТВОИ ДАННЫЕ ПРОКСИ (Нидерланды)
-const PROXY_URL = "http://aizhezhe01:LDtU5YgXwP@217.194.153.249:50100";
+const PROXY_URL = "http://g4alts:nT6UVMhowL@45.153.162.250:59100";
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 const historyStore = {};
