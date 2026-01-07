@@ -306,6 +306,22 @@ wss.on("connection", ws => {
   });
 });
 
+// === 🛡️ СИСТЕМА ANTI-SLEEP (ВСТАВИТЬ ПЕРЕД init()) 🛡️ ===
+const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; // <-- ЗАМЕНИ НА СВОЙ URL
+
+// Запускаем задачу каждые 10 минут
+cron.schedule("*/10 * * * *", async () => {
+    console.log("⏰ Anti-Sleep: Pinging Main Server...");
+    try {
+        // Пингуем endpoint /api/health второго сервера
+        const response = await fetch(`${MAIN_SERVER_URL}/api/health`);
+        if (response.ok) console.log("✅ Main Server is awake");
+        else console.log("⚠️ Main Server responded with " + response.status);
+    } catch (e) {
+        console.error("❌ Anti-Sleep Error:", e.message);
+    }
+});
+
 async function init() {
   for (const p of PRODUCTS) await loadHistoryFor(p);
   connectBinanceWS();
