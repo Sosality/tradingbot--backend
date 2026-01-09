@@ -6,15 +6,14 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { Pool } from "pg"; // БД для ликвидаций
+import { Pool } from "pg"; 
 import cron from "node-cron";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// === 🔥 ДОБАВЛЯЕМ HEALTH CHECK ROUTE 🔥 ===
-// Это endpoint, который будет дергать второй сервер, чтобы проверить, что этот жив
+// === 🔥 HEALTH CHECK ROUTE 🔥 ===
 app.get("/health", (req, res) => {
     res.status(200).send("Im Alive");
 });
@@ -27,7 +26,6 @@ const PRODUCTS = ["BTC-USD", "ETH-USD"];
 const COINBASE_REST = "https://api.exchange.coinbase.com";
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 const PROXY_URL = "http://g4alts:nT6UVMhowL@45.153.162.250:59100";
-// Твоя БД
 const DATABASE_URL = "postgresql://neondb_owner:npg_igxGcyUQmX52@ep-ancient-sky-a9db2z9z-pooler.gwc.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -72,7 +70,7 @@ function broadcast(msg) {
   });
 }
 
-// === TELEGRAM ALERT (УЛУЧШЕННАЯ ВЕРСИЯ) ===
+// === TELEGRAM ALERT ===
 async function sendTelegramAlert(userId, message) {
     if (!BOT_TOKEN || !userId) {
         console.error("⚠️ TG Alert skipped: No Token or User ID");
@@ -81,8 +79,6 @@ async function sendTelegramAlert(userId, message) {
     
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        
-        // Добавляем await, чтобы мы точно дождались ответа
         const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -93,38 +89,29 @@ async function sendTelegramAlert(userId, message) {
             })
         });
 
-        // Пытаемся распарсить ответ
         const data = await response.json();
 
         if (!data.ok) {
-            // Если Telegram вернул ошибку (например, 400 или 403)
-            console.error(`❌ TELEGRAM API ERROR for User ${userId}:`);
-            console.error(`   Error Code: ${data.error_code}`);
-            console.error(`   Description: ${data.description}`);
+            console.error(`❌ TELEGRAM API ERROR for User ${userId}: ${data.description}`);
         } else {
-            // Успешная отправка
-            console.log(`✅ Message sent to ${userId}. Message ID: ${data.result.message_id}`);
+            console.log(`✅ Message sent to ${userId}`);
         }
-
     } catch (e) {
-        // Ошибка сети или самого fetch
         console.error("❌ NETWORK/FETCH ERROR:", e.message);
     }
 }
 
 let isProcessing = false;
 
-// === 🔥 LIQUIDATION ENGINE (UPDATED) 🔥 ===
+// === 🔥 LIQUIDATION ENGINE 🔥 ===
 async function checkLiquidations() {
-    // Если предыдущая проверка еще идет или нет цен — пропускаем такт
     if (isProcessing || Object.keys(latestPrice).length === 0) return;
     
-    isProcessing = true; // Блокируем вход
+    isProcessing = true; 
 
     try {
         const res = await db.query(`SELECT * FROM positions`);
         
-        // Если позиций нет, сразу выходим
         if (res.rows.length === 0) {
             isProcessing = false;
             return;
@@ -135,10 +122,9 @@ async function checkLiquidations() {
             if (!currentPrice) continue;
 
             const entry = Number(pos.entry_price);
-            const size = Number(pos.size); // Объем позиции (Margin * Leverage)
+            const size = Number(pos.size); 
             const margin = Number(pos.margin);
             
-            // 1. Считаем PnL
             let pnl = 0;
             const diff = (currentPrice - entry) / entry;
             
@@ -148,29 +134,19 @@ async function checkLiquidations() {
                 pnl = -diff * size;
             }
 
-            // 2. Расчет порогов безопасности
-            // Комиссия за закрытие (например, 0.03%)
             const closeCommission = size * 0.0003; 
-            // Поддерживающая маржа (например, 0.4% от объема)
             const maintenanceMargin = size * 0.004; 
-
-            // Сколько денег осталось у пользователя в сделке
             const remainingEquity = margin + pnl;
-
-            // Порог ликвидации (нужно оставить хотя бы на комиссию и поддержку)
             const liquidationThreshold = closeCommission + maintenanceMargin;
 
-            // === 3. ПРОВЕРКА НА ЛИКВИДАЦИЮ ===
+            // === ЛИКВИДАЦИЯ ===
             if (remainingEquity <= liquidationThreshold) {
                 console.log(`💀 LIQUIDATING: User ${pos.user_id} | ${pos.pair}`);
-                // PnL при ликвидации равен минус маржа (пользователь теряет всё)
                 await executeLiquidation(pos, currentPrice, size, -margin);
                 continue; 
             }
 
-            // === 4. MARGIN CALL (ENGLISH WARNING) ===
-            // Предупреждаем, если Equity опустилось близко к порогу (например, запас < 20% от порога)
-            // Логика: Если осталось денег меньше, чем 1.2 * порог смерти, шлем алерт
+            // === ПРЕДУПРЕЖДЕНИЕ ===
             const warningThreshold = liquidationThreshold * 1.2; 
 
             if (!pos.warning_sent && remainingEquity <= warningThreshold) {
@@ -183,19 +159,15 @@ async function checkLiquidations() {
                             `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
                             `System will auto-liquidate if equity drops further.`;
 
-                // Отправляем сообщение
                 await sendTelegramAlert(pos.user_id, msg);
-                
-                // Ставим флаг в БД, чтобы не отправлять сообщение повторно
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
-                
                 console.log(`⚠️ Warning sent to user ${pos.user_id}`);
             }
         }
     } catch (e) {
         console.error("Liquidation Loop Error:", e.message);
     } finally {
-        isProcessing = false; // Разблокируем вход
+        isProcessing = false; 
     }
 }
 
@@ -203,19 +175,14 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     const client = await db.connect();
     try {
         await client.query("BEGIN");
-
-        // 1. Записываем в историю сделок
         await client.query(`
             INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue, 0]);
 
-        // 2. Удаляем позицию из активных
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
-
         await client.query("COMMIT");
         
-        // 3. Уведомление о ликвидации (Тоже на английском)
         const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
                     `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
                     `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
@@ -231,9 +198,7 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     }
 }
 
-// Запускаем проверку каждые 0.5 секунды (очень быстро, чтобы успеть)
 setInterval(checkLiquidations, 500);
-
 
 // === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
 async function loadHistoryFor(product) {
@@ -249,7 +214,7 @@ async function loadHistoryFor(product) {
       low: Number(c[1]),
       close: Number(c[4]),
     })).sort((a, b) => a.time - b.time).slice(-1440);
-    console.log(`✅ История ${product} загружена`);
+    // console.log(`✅ История ${product} обновлена`); // Можно раскомментировать для отладки
   } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
 }
 
@@ -263,7 +228,7 @@ function connectBinanceWS() {
   }).join("/");
 
   console.log("🌐 Подключение к Binance Global через прокси (NL)...");
-   
+    
   binanceWS = new WebSocket(BINANCE_WS_BASE + streams, { agent: proxyAgent });
 
   binanceWS.on("open", () => console.log("✅ Соединение с Binance установлено!"));
@@ -333,20 +298,22 @@ wss.on("connection", ws => {
   });
 });
 
-// === 🛡️ СИСТЕМА ANTI-SLEEP (ВСТАВИТЬ ПЕРЕД init()) 🛡️ ===
-const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; // <-- ЗАМЕНИ НА СВОЙ URL
+// === 🛡️ СИСТЕМА ANTI-SLEEP ===
+const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; 
 
-// Запускаем задачу каждые 10 минут
+// 1. Пингуем другой сервер
 cron.schedule("*/10 * * * *", async () => {
-    console.log("⏰ Anti-Sleep: Pinging Main Server...");
+    // console.log("⏰ Anti-Sleep: Pinging Main Server...");
     try {
-        // Пингуем endpoint /api/health второго сервера
-        const response = await fetch(`${MAIN_SERVER_URL}/api/health`);
-        if (response.ok) console.log("✅ Main Server is awake");
-        else console.log("⚠️ Main Server responded with " + response.status);
-    } catch (e) {
-        console.error("❌ Anti-Sleep Error:", e.message);
-    }
+        await fetch(`${MAIN_SERVER_URL}/api/health`);
+    } catch (e) { }
+});
+
+// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
+// Обновляем массив истории свечей каждую минуту, чтобы новые пользователи видели актуальные данные
+cron.schedule("*/1 * * * *", async () => {
+    // console.log("🔄 Updating Candle History...");
+    for (const p of PRODUCTS) await loadHistoryFor(p);
 });
 
 async function init() {
