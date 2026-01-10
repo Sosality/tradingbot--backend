@@ -72,32 +72,16 @@ function broadcast(msg) {
 
 // === TELEGRAM ALERT ===
 async function sendTelegramAlert(userId, message) {
-    if (!BOT_TOKEN || !userId) {
-        console.error("⚠️ TG Alert skipped: No Token or User ID");
-        return;
-    }
-    
+    if (!BOT_TOKEN || !userId) return;
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        const response = await fetch(url, {
+        await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                chat_id: userId, 
-                text: message, 
-                parse_mode: 'HTML' 
-            })
+            body: JSON.stringify({ chat_id: userId, text: message, parse_mode: 'HTML' })
         });
-
-        const data = await response.json();
-
-        if (!data.ok) {
-            console.error(`❌ TELEGRAM API ERROR for User ${userId}: ${data.description}`);
-        } else {
-            console.log(`✅ Message sent to ${userId}`);
-        }
     } catch (e) {
-        console.error("❌ NETWORK/FETCH ERROR:", e.message);
+        console.error("❌ TG ERROR:", e.message);
     }
 }
 
@@ -106,12 +90,10 @@ let isProcessing = false;
 // === 🔥 LIQUIDATION ENGINE 🔥 ===
 async function checkLiquidations() {
     if (isProcessing || Object.keys(latestPrice).length === 0) return;
-    
     isProcessing = true; 
 
     try {
         const res = await db.query(`SELECT * FROM positions`);
-        
         if (res.rows.length === 0) {
             isProcessing = false;
             return;
@@ -150,18 +132,13 @@ async function checkLiquidations() {
             const warningThreshold = liquidationThreshold * 1.2; 
 
             if (!pos.warning_sent && remainingEquity <= warningThreshold) {
-                const pnlFormatted = pnl.toFixed(2);
-                
                 const msg = `⚠️ <b>MARGIN CALL WARNING</b> ⚠️\n\n` +
-                            `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n\n` +
-                            `📉 PnL: ${pnlFormatted} VP\n` +
-                            `💰 Remaining Equity: ${remainingEquity.toFixed(2)} VP\n` +
-                            `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
-                            `System will auto-liquidate if equity drops further.`;
+                            `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n` +
+                            `💰 Equity: ${remainingEquity.toFixed(2)} VP\n` +
+                            `System will auto-liquidate shortly.`;
 
                 await sendTelegramAlert(pos.user_id, msg);
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
-                console.log(`⚠️ Warning sent to user ${pos.user_id}`);
             }
         }
     } catch (e) {
@@ -183,11 +160,7 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
         await client.query("COMMIT");
         
-        const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
-                    `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
-                    `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
-                    `Price reached liquidation level.`;
-                    
+        const msg = `⛔️ <b>LIQUIDATED</b>\n\nPos: <b>${pos.pair}</b>\nLoss: ${pnlValue.toFixed(2)} VP`;
         sendTelegramAlert(pos.user_id, msg);
 
     } catch (e) {
@@ -200,21 +173,42 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
 
 setInterval(checkLiquidations, 500);
 
-// === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
+// === 1. ЗАГРУЗКА ИСТОРИИ (СИНХРОНИЗИРОВАННАЯ) ===
 async function loadHistoryFor(product) {
   try {
     const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
     const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
     if (!r.ok) return;
+    
     const chunk = await r.json();
-    historyStore[product] = chunk.map(c => ({
+    let candles = chunk.map(c => ({
       time: Math.floor(c[0]),
       open: Number(c[3]),
       high: Number(c[2]),
       low: Number(c[1]),
       close: Number(c[4]),
     })).sort((a, b) => a.time - b.time).slice(-1440);
-    // console.log(`✅ История ${product} обновлена`); // Можно раскомментировать для отладки
+
+    // 🔥 ФИКС БОЛЬШОЙ СВЕЧИ 🔥
+    // Если у нас уже есть цена от Binance, мы подгоняем историю Coinbase под неё.
+    if (latestPrice[product] && candles.length > 0) {
+        const lastCandle = candles[candles.length - 1];
+        const binancePrice = latestPrice[product];
+        const difference = binancePrice - lastCandle.close; // Разница между биржами
+
+        // Смещаем ВСЕ свечи на эту разницу, чтобы график был бесшовным
+        candles = candles.map(c => ({
+            time: c.time,
+            open: c.open + difference,
+            high: c.high + difference,
+            low: c.low + difference,
+            close: c.close + difference
+        }));
+        // console.log(`🔧 Synced ${product}: Shifted by ${difference.toFixed(2)}`);
+    }
+
+    historyStore[product] = candles;
+
   } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
 }
 
@@ -289,6 +283,7 @@ wss.on("connection", ws => {
       const data = JSON.parse(raw.toString());
       if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
         ws.subscriptions.add(data.pair);
+        // При подписке мы отправляем уже "сдвинутую" историю, совпадающую с ценой Binance
         if (historyStore[data.pair]) ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
         if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
         if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
@@ -298,27 +293,24 @@ wss.on("connection", ws => {
   });
 });
 
-// === 🛡️ СИСТЕМА ANTI-SLEEP ===
 const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; 
 
-// 1. Пингуем другой сервер
 cron.schedule("*/10 * * * *", async () => {
-    // console.log("⏰ Anti-Sleep: Pinging Main Server...");
-    try {
-        await fetch(`${MAIN_SERVER_URL}/api/health`);
-    } catch (e) { }
+    try { await fetch(`${MAIN_SERVER_URL}/api/health`); } catch (e) { }
 });
 
-// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
-// Обновляем массив истории свечей каждую минуту, чтобы новые пользователи видели актуальные данные
+// Обновляем историю чаще и синхронизируем её
 cron.schedule("*/1 * * * *", async () => {
-    // console.log("🔄 Updating Candle History...");
     for (const p of PRODUCTS) await loadHistoryFor(p);
 });
 
 async function init() {
-  for (const p of PRODUCTS) await loadHistoryFor(p);
   connectBinanceWS();
+  // Ждем 2 секунды, чтобы получить цену Binance ПЕРЕД загрузкой истории для синхронизации
+  setTimeout(async () => {
+      for (const p of PRODUCTS) await loadHistoryFor(p);
+  }, 2000);
+  
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => console.log(`🚀 PriceServer running on port ${PORT}`));
 }
