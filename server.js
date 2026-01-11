@@ -334,6 +334,8 @@ wss.on("connection", ws => {
                 const granularity = data.timeframe || 60;
                 const oldestTime = data.until; // Timestamp of the leftmost visible candle
 
+                console.log(`📥 loadMore request: ${data.pair} @ ${granularity}s, before ${new Date(oldestTime * 1000).toISOString()}`);
+
                 if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
                     const fullHistory = historyStore[data.pair][granularity];
                     // Find candles older than oldestTime
@@ -342,14 +344,24 @@ wss.on("connection", ws => {
                     // Take a chunk, e.g., 300 previous candles
                     const chunk = olderCandles.slice(-300);
 
-                    if (chunk.length > 0) {
-                        ws.send(JSON.stringify({
-                            type: "moreHistory",
-                            pair: data.pair,
-                            data: chunk,
-                            timeframe: granularity
-                        }));
-                    }
+                    console.log(`📤 Found ${chunk.length} older candles to send back`);
+
+                    // ALWAYS send response (even if empty) so client knows to stop waiting
+                    ws.send(JSON.stringify({
+                        type: "moreHistory",
+                        pair: data.pair,
+                        data: chunk,
+                        timeframe: granularity
+                    }));
+                } else {
+                    // Data not loaded yet, send empty response
+                    console.log(`⚠️ History not available for ${data.pair} @ ${granularity}s`);
+                    ws.send(JSON.stringify({
+                        type: "moreHistory",
+                        pair: data.pair,
+                        data: [],
+                        timeframe: granularity
+                    }));
                 }
             }
 
