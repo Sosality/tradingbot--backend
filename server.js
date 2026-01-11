@@ -201,21 +201,25 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
 setInterval(checkLiquidations, 500);
 
 // === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
-async function loadHistoryFor(product) {
+async function loadHistoryFor(product, granularity = 60) {
     try {
-        const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
+        const url = `${COINBASE_REST}/products/${product}/candles?granularity=${granularity}`;
         const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
         if (!r.ok) return;
         const chunk = await r.json();
-        historyStore[product] = chunk.map(c => ({
+
+        if (!historyStore[product]) historyStore[product] = {};
+
+        historyStore[product][granularity] = chunk.map(c => ({
             time: Math.floor(c[0]),
             open: Number(c[3]),
             high: Number(c[2]),
             low: Number(c[1]),
             close: Number(c[4]),
-        })).sort((a, b) => a.time - b.time).slice(-1440);
-        // console.log(`✅ История ${product} обновлена`); // Можно раскомментировать для отладки
-    } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
+        })).sort((a, b) => a.time - b.time);
+
+        // console.log(`✅ История ${product} (${granularity}s) обновлена`);
+    } catch (e) { console.error(`Ошибка истории ${product} (${granularity}s):`, e.message); }
 }
 
 // === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
