@@ -6,7 +6,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket, { WebSocketServer } from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { Pool } from "pg"; 
+import { Pool } from "pg";
 import cron from "node-cron";
 
 const app = express();
@@ -33,41 +33,41 @@ const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 const historyStore = {};
 const orderbookStore = {};
-const tradesStore = {}; 
+const tradesStore = {};
 const latestPrice = {};
 
 // === ПОДКЛЮЧЕНИЕ К БД ===
 const db = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: true
+    connectionString: DATABASE_URL,
+    ssl: true
 });
 
 db.connect().then(() => console.log("✅ Liquidation Engine Connected")).catch(e => console.error("DB Error:", e.message));
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getBinanceSymbol(product) {
-  return product.replace("-", "").toLowerCase() + "t"; 
+    return product.replace("-", "").toLowerCase() + "t";
 }
 
 function getCoinbaseSymbol(binanceStreamName) {
-  const symbol = binanceStreamName.split("@")[0];
-  return symbol.toUpperCase().replace("USDT", "-USD");
+    const symbol = binanceStreamName.split("@")[0];
+    return symbol.toUpperCase().replace("USDT", "-USD");
 }
 
 function formatBinanceOrderBook(bids, asks) {
-  const format = (arr) => arr.map(([p, s]) => ({ price: Number(p), size: Number(s) }));
-  return { buy: format(bids), sell: format(asks) };
+    const format = (arr) => arr.map(([p, s]) => ({ price: Number(p), size: Number(s) }));
+    return { buy: format(bids), sell: format(asks) };
 }
 
 function broadcast(msg) {
-  const text = JSON.stringify(msg);
-  const pair = msg.pair;
-  wss.clients.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) {
-      if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
-      ws.send(text);
-    }
-  });
+    const text = JSON.stringify(msg);
+    const pair = msg.pair;
+    wss.clients.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) {
+            if (pair && ws.subscriptions && !ws.subscriptions.has(pair)) return;
+            ws.send(text);
+        }
+    });
 }
 
 // === TELEGRAM ALERT ===
@@ -76,16 +76,16 @@ async function sendTelegramAlert(userId, message) {
         console.error("⚠️ TG Alert skipped: No Token or User ID");
         return;
     }
-    
+
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
         const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                chat_id: userId, 
-                text: message, 
-                parse_mode: 'HTML' 
+            body: JSON.stringify({
+                chat_id: userId,
+                text: message,
+                parse_mode: 'HTML'
             })
         });
 
@@ -106,12 +106,12 @@ let isProcessing = false;
 // === 🔥 LIQUIDATION ENGINE 🔥 ===
 async function checkLiquidations() {
     if (isProcessing || Object.keys(latestPrice).length === 0) return;
-    
-    isProcessing = true; 
+
+    isProcessing = true;
 
     try {
         const res = await db.query(`SELECT * FROM positions`);
-        
+
         if (res.rows.length === 0) {
             isProcessing = false;
             return;
@@ -122,20 +122,20 @@ async function checkLiquidations() {
             if (!currentPrice) continue;
 
             const entry = Number(pos.entry_price);
-            const size = Number(pos.size); 
+            const size = Number(pos.size);
             const margin = Number(pos.margin);
-            
+
             let pnl = 0;
             const diff = (currentPrice - entry) / entry;
-            
+
             if (pos.type === "LONG") {
                 pnl = diff * size;
             } else {
                 pnl = -diff * size;
             }
 
-            const closeCommission = size * 0.0003; 
-            const maintenanceMargin = size * 0.004; 
+            const closeCommission = size * 0.0003;
+            const maintenanceMargin = size * 0.004;
             const remainingEquity = margin + pnl;
             const liquidationThreshold = closeCommission + maintenanceMargin;
 
@@ -143,21 +143,21 @@ async function checkLiquidations() {
             if (remainingEquity <= liquidationThreshold) {
                 console.log(`💀 LIQUIDATING: User ${pos.user_id} | ${pos.pair}`);
                 await executeLiquidation(pos, currentPrice, size, -margin);
-                continue; 
+                continue;
             }
 
             // === ПРЕДУПРЕЖДЕНИЕ ===
-            const warningThreshold = liquidationThreshold * 1.2; 
+            const warningThreshold = liquidationThreshold * 1.2;
 
             if (!pos.warning_sent && remainingEquity <= warningThreshold) {
                 const pnlFormatted = pnl.toFixed(2);
-                
+
                 const msg = `⚠️ <b>MARGIN CALL WARNING</b> ⚠️\n\n` +
-                            `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n\n` +
-                            `📉 PnL: ${pnlFormatted} VP\n` +
-                            `💰 Remaining Equity: ${remainingEquity.toFixed(2)} VP\n` +
-                            `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
-                            `System will auto-liquidate if equity drops further.`;
+                    `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n\n` +
+                    `📉 PnL: ${pnlFormatted} VP\n` +
+                    `💰 Remaining Equity: ${remainingEquity.toFixed(2)} VP\n` +
+                    `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
+                    `System will auto-liquidate if equity drops further.`;
 
                 await sendTelegramAlert(pos.user_id, msg);
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
@@ -167,7 +167,7 @@ async function checkLiquidations() {
     } catch (e) {
         console.error("Liquidation Loop Error:", e.message);
     } finally {
-        isProcessing = false; 
+        isProcessing = false;
     }
 }
 
@@ -182,12 +182,12 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
 
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
         await client.query("COMMIT");
-        
+
         const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
-                    `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
-                    `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
-                    `Price reached liquidation level.`;
-                    
+            `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
+            `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
+            `Price reached liquidation level.`;
+
         sendTelegramAlert(pos.user_id, msg);
 
     } catch (e) {
@@ -202,104 +202,158 @@ setInterval(checkLiquidations, 500);
 
 // === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
 async function loadHistoryFor(product) {
-  try {
-    const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
-    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
-    if (!r.ok) return;
-    const chunk = await r.json();
-    historyStore[product] = chunk.map(c => ({
-      time: Math.floor(c[0]),
-      open: Number(c[3]),
-      high: Number(c[2]),
-      low: Number(c[1]),
-      close: Number(c[4]),
-    })).sort((a, b) => a.time - b.time).slice(-1440);
-    // console.log(`✅ История ${product} обновлена`); // Можно раскомментировать для отладки
-  } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
+    try {
+        const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
+        const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
+        if (!r.ok) return;
+        const chunk = await r.json();
+        historyStore[product] = chunk.map(c => ({
+            time: Math.floor(c[0]),
+            open: Number(c[3]),
+            high: Number(c[2]),
+            low: Number(c[1]),
+            close: Number(c[4]),
+        })).sort((a, b) => a.time - b.time).slice(-1440);
+        // console.log(`✅ История ${product} обновлена`); // Можно раскомментировать для отладки
+    } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
 }
 
 // === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
 let binanceWS;
 
 function connectBinanceWS() {
-  const streams = PRODUCTS.map(p => {
-    const sym = getBinanceSymbol(p);
-    return `${sym}@depth20@100ms/${sym}@aggTrade/${sym}@ticker`;
-  }).join("/");
+    const streams = PRODUCTS.map(p => {
+        const sym = getBinanceSymbol(p);
+        return `${sym}@depth20@100ms/${sym}@aggTrade/${sym}@ticker`;
+    }).join("/");
 
-  console.log("🌐 Подключение к Binance Global через прокси (NL)...");
-    
-  binanceWS = new WebSocket(BINANCE_WS_BASE + streams, { agent: proxyAgent });
+    console.log("🌐 Подключение к Binance Global через прокси (NL)...");
 
-  binanceWS.on("open", () => console.log("✅ Соединение с Binance установлено!"));
+    binanceWS = new WebSocket(BINANCE_WS_BASE + streams, { agent: proxyAgent });
 
-  binanceWS.on("message", raw => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (!msg.data || !msg.stream) return;
+    binanceWS.on("open", () => console.log("✅ Соединение с Binance установлено!"));
 
-      const pair = getCoinbaseSymbol(msg.stream);
-      const streamName = msg.stream.split("@")[1];
+    binanceWS.on("message", raw => {
+        try {
+            const msg = JSON.parse(raw.toString());
+            if (!msg.data || !msg.stream) return;
 
-      if (streamName.startsWith("depth")) {
-        orderbookStore[pair] = formatBinanceOrderBook(msg.data.bids, msg.data.asks);
-      } 
-      else if (streamName === "ticker") {
-        latestPrice[pair] = Number(msg.data.c);
-        broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
-      }
-      else if (streamName === "aggTrade") {
-        if (!tradesStore[pair]) tradesStore[pair] = [];
-        const trade = {
-          price: Number(msg.data.p),
-          size: Number(msg.data.q),
-          side: msg.data.m ? "sell" : "buy",
-          time: msg.data.T
-        };
-        tradesStore[pair].push(trade);
-        if (tradesStore[pair].length > 50) tradesStore[pair].shift();
-        broadcast({ type: "trades", pair, trades: [trade] });
-      }
-    } catch (e) { console.error("Parse error:", e); }
-  });
+            const pair = getCoinbaseSymbol(msg.stream);
+            const streamName = msg.stream.split("@")[1];
 
-  binanceWS.on("error", err => {
-    console.error("❌ WS Error:", err.message);
-  });
+            if (streamName.startsWith("depth")) {
+                orderbookStore[pair] = formatBinanceOrderBook(msg.data.bids, msg.data.asks);
+            }
+            else if (streamName === "ticker") {
+                latestPrice[pair] = Number(msg.data.c);
+                broadcast({ type: "price", pair, price: latestPrice[pair], ts: Date.now() });
+            }
+            else if (streamName === "aggTrade") {
+                if (!tradesStore[pair]) tradesStore[pair] = [];
+                const trade = {
+                    price: Number(msg.data.p),
+                    size: Number(msg.data.q),
+                    side: msg.data.m ? "sell" : "buy",
+                    time: msg.data.T
+                };
+                tradesStore[pair].push(trade);
+                if (tradesStore[pair].length > 50) tradesStore[pair].shift();
+                broadcast({ type: "trades", pair, trades: [trade] });
+            }
+        } catch (e) { console.error("Parse error:", e); }
+    });
 
-  binanceWS.on("close", () => {
-    console.log("Reconnecting Binance...");
-    setTimeout(connectBinanceWS, 5000);
-  });
+    binanceWS.on("error", err => {
+        console.error("❌ WS Error:", err.message);
+    });
+
+    binanceWS.on("close", () => {
+        console.log("Reconnecting Binance...");
+        setTimeout(connectBinanceWS, 5000);
+    });
 }
 
 setInterval(() => {
-  PRODUCTS.forEach(pair => {
-    if (orderbookStore[pair]) {
-      broadcast({ type: "orderBook", pair, ...orderbookStore[pair], ts: Date.now() });
-    }
-  });
+    PRODUCTS.forEach(pair => {
+        if (orderbookStore[pair]) {
+            broadcast({ type: "orderBook", pair, ...orderbookStore[pair], ts: Date.now() });
+        }
+    });
 }, 200);
 
 // === 3. СЕРВЕР ДЛЯ КЛИЕНТОВ ===
 wss.on("connection", ws => {
-  ws.subscriptions = new Set();
-  ws.on("message", raw => {
-    try {
-      const data = JSON.parse(raw.toString());
-      if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
-        ws.subscriptions.add(data.pair);
-        if (historyStore[data.pair]) ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
-        if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
-        if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
-        if (tradesStore[data.pair]) ws.send(JSON.stringify({ type: "trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
-      }
-    } catch (e) { console.error(e); }
-  });
+    ws.subscriptions = new Set();
+
+    ws.on("message", async raw => {
+        try {
+            const data = JSON.parse(raw.toString());
+
+            // SUBSCRIBE / CHANGE TIMEFRAME
+            if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
+                ws.subscriptions.add(data.pair);
+                const granularity = data.timeframe || 60; // Default 1m
+
+                // Send History
+                if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
+                    // Send last 300 candles initially
+                    const fullHistory = historyStore[data.pair][granularity];
+                    const initialData = fullHistory.slice(-300);
+                    ws.send(JSON.stringify({
+                        type: "history",
+                        pair: data.pair,
+                        data: initialData,
+                        timeframe: granularity
+                    }));
+                } else {
+                     // Try to load on demand if missing
+                     await loadHistoryFor(data.pair, granularity);
+                     if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
+                        const fullHistory = historyStore[data.pair][granularity];
+                        ws.send(JSON.stringify({
+                            type: "history",
+                            pair: data.pair,
+                            data: fullHistory.slice(-300),
+                            timeframe: granularity
+                        }));
+                     }
+                }
+
+                if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
+                if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
+                if (tradesStore[data.pair]) ws.send(JSON.stringify({ type: "trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
+            }
+
+            // LOAD MORE HISTORY (LAZY LOADING)
+            if (data.type === "loadMore" && PRODUCTS.includes(data.pair)) {
+                const granularity = data.timeframe || 60;
+                const oldestTime = data.until; // Timestamp of the leftmost visible candle
+
+                if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
+                    const fullHistory = historyStore[data.pair][granularity];
+                    // Find candles older than oldestTime
+                    // Since array is sorted by time ascending, filter or find index
+                    const olderCandles = fullHistory.filter(c => c.time < oldestTime);
+                    // Take a chunk, e.g., 300 previous candles
+                    const chunk = olderCandles.slice(-300);
+
+                    if (chunk.length > 0) {
+                        ws.send(JSON.stringify({
+                            type: "moreHistory",
+                            pair: data.pair,
+                            data: chunk,
+                            timeframe: granularity
+                        }));
+                    }
+                }
+            }
+
+        } catch (e) { console.error(e); }
+    });
 });
 
 // === 🛡️ СИСТЕМА ANTI-SLEEP ===
-const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; 
+const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com";
 
 // 1. Пингуем другой сервер
 cron.schedule("*/10 * * * *", async () => {
@@ -310,17 +364,25 @@ cron.schedule("*/10 * * * *", async () => {
 });
 
 // === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
-// Обновляем массив истории свечей каждую минуту, чтобы новые пользователи видели актуальные данные
+// Обновляем массив истории свечей каждую минуту
 cron.schedule("*/1 * * * *", async () => {
     // console.log("🔄 Updating Candle History...");
-    for (const p of PRODUCTS) await loadHistoryFor(p);
+    for (const p of PRODUCTS) {
+        for (const tf of TIMEFRAMES) {
+             await loadHistoryFor(p, tf);
+        }
+    }
 });
 
 async function init() {
-  for (const p of PRODUCTS) await loadHistoryFor(p);
-  connectBinanceWS();
-  const PORT = process.env.PORT || 3000;
-  server.listen(PORT, () => console.log(`🚀 PriceServer running on port ${PORT}`));
+    for (const p of PRODUCTS) {
+        for (const tf of TIMEFRAMES) {
+            await loadHistoryFor(p, tf);
+        }
+    }
+    connectBinanceWS();
+    const PORT = process.env.PORT || 3000;
+    server.listen(PORT, () => console.log(`🚀 PriceServer running on port ${PORT}`));
 }
 
 init();
