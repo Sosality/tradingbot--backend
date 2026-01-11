@@ -23,11 +23,10 @@ const wss = new WebSocketServer({ server });
 
 // === НАСТРОЙКИ ===
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
-// ⬇️ ИСПОЛЬЗУЕМ BINANCE API ВМЕСТО COINBASE ДЛЯ ИСТОРИИ
-const BINANCE_REST = "https://api.binance.com/api/v3"; 
+const COINBASE_REST = "https://api.exchange.coinbase.com";
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 const PROXY_URL = "http://g4alts:nT6UVMhowL@45.153.162.250:59100";
-const DATABASE_URL = process.env.DATABASE_URL; // Убедитесь, что переменная есть в .env
+const DATABASE_URL = "postgresql://neondb_owner:npg_igxGcyUQmX52@ep-ancient-sky-a9db2z9z-pooler.gwc.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
@@ -40,19 +39,17 @@ const latestPrice = {};
 // === ПОДКЛЮЧЕНИЕ К БД ===
 const db = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Иногда нужно для Render/Neon
+  ssl: true
 });
 
 db.connect().then(() => console.log("✅ Liquidation Engine Connected")).catch(e => console.error("DB Error:", e.message));
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getBinanceSymbol(product) {
-  // BTC-USD -> btcusdt
   return product.replace("-", "").toLowerCase() + "t"; 
 }
 
 function getCoinbaseSymbol(binanceStreamName) {
-  // btcusdt -> BTC-USD
   const symbol = binanceStreamName.split("@")[0];
   return symbol.toUpperCase().replace("USDT", "-USD");
 }
@@ -75,15 +72,33 @@ function broadcast(msg) {
 
 // === TELEGRAM ALERT ===
 async function sendTelegramAlert(userId, message) {
-    if (!BOT_TOKEN || !userId) return;
+    if (!BOT_TOKEN || !userId) {
+        console.error("⚠️ TG Alert skipped: No Token or User ID");
+        return;
+    }
+    
     try {
         const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        await fetch(url, {
+        const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: userId, text: message, parse_mode: 'HTML' })
+            body: JSON.stringify({ 
+                chat_id: userId, 
+                text: message, 
+                parse_mode: 'HTML' 
+            })
         });
-    } catch (e) { console.error("TG Error:", e.message); }
+
+        const data = await response.json();
+
+        if (!data.ok) {
+            console.error(`❌ TELEGRAM API ERROR for User ${userId}: ${data.description}`);
+        } else {
+            console.log(`✅ Message sent to ${userId}`);
+        }
+    } catch (e) {
+        console.error("❌ NETWORK/FETCH ERROR:", e.message);
+    }
 }
 
 let isProcessing = false;
@@ -91,11 +106,16 @@ let isProcessing = false;
 // === 🔥 LIQUIDATION ENGINE 🔥 ===
 async function checkLiquidations() {
     if (isProcessing || Object.keys(latestPrice).length === 0) return;
+    
     isProcessing = true; 
 
     try {
         const res = await db.query(`SELECT * FROM positions`);
-        if (res.rows.length === 0) { isProcessing = false; return; }
+        
+        if (res.rows.length === 0) {
+            isProcessing = false;
+            return;
+        }
 
         for (const pos of res.rows) {
             const currentPrice = latestPrice[pos.pair];
@@ -128,10 +148,20 @@ async function checkLiquidations() {
 
             // === ПРЕДУПРЕЖДЕНИЕ ===
             const warningThreshold = liquidationThreshold * 1.2; 
+
             if (!pos.warning_sent && remainingEquity <= warningThreshold) {
-                const msg = `⚠️ <b>MARGIN CALL</b> ⚠️\nPosition: ${pos.pair}\nEquity low!`;
+                const pnlFormatted = pnl.toFixed(2);
+                
+                const msg = `⚠️ <b>MARGIN CALL WARNING</b> ⚠️\n\n` +
+                            `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n\n` +
+                            `📉 PnL: ${pnlFormatted} VP\n` +
+                            `💰 Remaining Equity: ${remainingEquity.toFixed(2)} VP\n` +
+                            `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
+                            `System will auto-liquidate if equity drops further.`;
+
                 await sendTelegramAlert(pos.user_id, msg);
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
+                console.log(`⚠️ Warning sent to user ${pos.user_id}`);
             }
         }
     } catch (e) {
@@ -145,18 +175,21 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     const client = await db.connect();
     try {
         await client.query("BEGIN");
-        // ВНИМАНИЕ: Убедитесь, что таблица называется trades (как мы делали ранее) или trades_history
-        // Я использую 'trades', так как мы создавали её в прошлом шаге. Если у вас 'trades_history', поправьте.
         await client.query(`
-            INSERT INTO trades (user_id, pair, type, entry_price, close_price, size, leverage, pnl)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue]);
+            INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue, 0]);
 
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
         await client.query("COMMIT");
         
-        const msg = `⛔️ <b>LIQUIDATED</b>\n${pos.pair} closed.\nLoss: ${pnlValue.toFixed(2)} VP`;
+        const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
+                    `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
+                    `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
+                    `Price reached liquidation level.`;
+                    
         sendTelegramAlert(pos.user_id, msg);
+
     } catch (e) {
         await client.query("ROLLBACK");
         console.error("Liquidation DB Error:", e);
@@ -165,47 +198,41 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     }
 }
 
-setInterval(checkLiquidations, 1000);
+setInterval(checkLiquidations, 500);
 
-// === 1. ЗАГРУЗКА ИСТОРИИ (BINANCE) ===
-// Исправлено: теперь берем историю с Binance, чтобы совпадала с WebSockets
+// === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
 async function loadHistoryFor(product) {
   try {
-    const symbol = getBinanceSymbol(product).toUpperCase(); // BTCUSDT
-    // Запрашиваем 1000 свечей по 1 минуте
-    const url = `${BINANCE_REST}/klines?symbol=${symbol}&interval=1m&limit=1000`;
-    
-    // Binance API обычно не требует прокси для публичных данных, но если блокирует - добавьте agent
-    const r = await fetch(url);
+    const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
+    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
     if (!r.ok) return;
-    
-    const data = await r.json();
-    
-    // Binance Format: [ [time, open, high, low, close, vol, ...], ... ]
-    historyStore[product] = data.map(c => ({
-      time: Math.floor(c[0] / 1000), // Binance дает мс, нам нужны секунды для LightweightCharts
-      open: Number(c[1]),
+    const chunk = await r.json();
+    historyStore[product] = chunk.map(c => ({
+      time: Math.floor(c[0]),
+      open: Number(c[3]),
       high: Number(c[2]),
-      low: Number(c[3]),
+      low: Number(c[1]),
       close: Number(c[4]),
-    }));
-    
-    // console.log(`✅ История ${product} обновлена (Binance)`);
+    })).sort((a, b) => a.time - b.time).slice(-1440);
+    // console.log(`✅ История ${product} обновлена`); // Можно раскомментировать для отладки
   } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
 }
 
-// === 2. ПОДКЛЮЧЕНИЕ К BINANCE WS ===
+// === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
 let binanceWS;
+
 function connectBinanceWS() {
   const streams = PRODUCTS.map(p => {
     const sym = getBinanceSymbol(p);
     return `${sym}@depth20@100ms/${sym}@aggTrade/${sym}@ticker`;
   }).join("/");
 
-  console.log("🌐 Подключение к Binance WS...");
+  console.log("🌐 Подключение к Binance Global через прокси (NL)...");
+    
   binanceWS = new WebSocket(BINANCE_WS_BASE + streams, { agent: proxyAgent });
 
-  binanceWS.on("open", () => console.log("✅ WS Open"));
+  binanceWS.on("open", () => console.log("✅ Соединение с Binance установлено!"));
+
   binanceWS.on("message", raw => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -233,16 +260,24 @@ function connectBinanceWS() {
         if (tradesStore[pair].length > 50) tradesStore[pair].shift();
         broadcast({ type: "trades", pair, trades: [trade] });
       }
-    } catch (e) { }
+    } catch (e) { console.error("Parse error:", e); }
   });
 
-  binanceWS.on("close", () => setTimeout(connectBinanceWS, 5000));
-  binanceWS.on("error", (e) => console.error("WS Error", e.message));
+  binanceWS.on("error", err => {
+    console.error("❌ WS Error:", err.message);
+  });
+
+  binanceWS.on("close", () => {
+    console.log("Reconnecting Binance...");
+    setTimeout(connectBinanceWS, 5000);
+  });
 }
 
 setInterval(() => {
   PRODUCTS.forEach(pair => {
-    if (orderbookStore[pair]) broadcast({ type: "orderBook", pair, ...orderbookStore[pair] });
+    if (orderbookStore[pair]) {
+      broadcast({ type: "orderBook", pair, ...orderbookStore[pair], ts: Date.now() });
+    }
   });
 }, 200);
 
@@ -255,20 +290,29 @@ wss.on("connection", ws => {
       if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
         ws.subscriptions.add(data.pair);
         if (historyStore[data.pair]) ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
-        if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair] }));
+        if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
+        if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
+        if (tradesStore[data.pair]) ws.send(JSON.stringify({ type: "trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
       }
-    } catch (e) { }
+    } catch (e) { console.error(e); }
   });
 });
 
-// Anti-Sleep
+// === 🛡️ СИСТЕМА ANTI-SLEEP ===
 const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; 
+
+// 1. Пингуем другой сервер
 cron.schedule("*/10 * * * *", async () => {
-    try { await fetch(`${MAIN_SERVER_URL}/api/health`); } catch (e) { }
+    // console.log("⏰ Anti-Sleep: Pinging Main Server...");
+    try {
+        await fetch(`${MAIN_SERVER_URL}/api/health`);
+    } catch (e) { }
 });
 
-// History Update
+// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
+// Обновляем массив истории свечей каждую минуту, чтобы новые пользователи видели актуальные данные
 cron.schedule("*/1 * * * *", async () => {
+    // console.log("🔄 Updating Candle History...");
     for (const p of PRODUCTS) await loadHistoryFor(p);
 });
 
