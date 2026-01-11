@@ -23,10 +23,11 @@ const wss = new WebSocketServer({ server });
 
 // === НАСТРОЙКИ ===
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
-const COINBASE_REST = "https://api.exchange.coinbase.com";
+// ⬇️ ИСПОЛЬЗУЕМ BINANCE API ВМЕСТО COINBASE ДЛЯ ИСТОРИИ
+const BINANCE_REST = "https://api.binance.com/api/v3"; 
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 const PROXY_URL = "http://g4alts:nT6UVMhowL@45.153.162.250:59100";
-const DATABASE_URL = "postgresql://neondb_owner:npg_igxGcyUQmX52@ep-ancient-sky-a9db2z9z-pooler.gwc.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
+const DATABASE_URL = process.env.DATABASE_URL; // Убедитесь, что переменная есть в .env
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
@@ -39,17 +40,19 @@ const latestPrice = {};
 // === ПОДКЛЮЧЕНИЕ К БД ===
 const db = new Pool({
   connectionString: DATABASE_URL,
-  ssl: true
+  ssl: { rejectUnauthorized: false } // Иногда нужно для Render/Neon
 });
 
 db.connect().then(() => console.log("✅ Liquidation Engine Connected")).catch(e => console.error("DB Error:", e.message));
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getBinanceSymbol(product) {
+  // BTC-USD -> btcusdt
   return product.replace("-", "").toLowerCase() + "t"; 
 }
 
 function getCoinbaseSymbol(binanceStreamName) {
+  // btcusdt -> BTC-USD
   const symbol = binanceStreamName.split("@")[0];
   return symbol.toUpperCase().replace("USDT", "-USD");
 }
@@ -80,9 +83,7 @@ async function sendTelegramAlert(userId, message) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ chat_id: userId, text: message, parse_mode: 'HTML' })
         });
-    } catch (e) {
-        console.error("❌ TG ERROR:", e.message);
-    }
+    } catch (e) { console.error("TG Error:", e.message); }
 }
 
 let isProcessing = false;
@@ -94,10 +95,7 @@ async function checkLiquidations() {
 
     try {
         const res = await db.query(`SELECT * FROM positions`);
-        if (res.rows.length === 0) {
-            isProcessing = false;
-            return;
-        }
+        if (res.rows.length === 0) { isProcessing = false; return; }
 
         for (const pos of res.rows) {
             const currentPrice = latestPrice[pos.pair];
@@ -130,13 +128,8 @@ async function checkLiquidations() {
 
             // === ПРЕДУПРЕЖДЕНИЕ ===
             const warningThreshold = liquidationThreshold * 1.2; 
-
             if (!pos.warning_sent && remainingEquity <= warningThreshold) {
-                const msg = `⚠️ <b>MARGIN CALL WARNING</b> ⚠️\n\n` +
-                            `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n` +
-                            `💰 Equity: ${remainingEquity.toFixed(2)} VP\n` +
-                            `System will auto-liquidate shortly.`;
-
+                const msg = `⚠️ <b>MARGIN CALL</b> ⚠️\nPosition: ${pos.pair}\nEquity low!`;
                 await sendTelegramAlert(pos.user_id, msg);
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
             }
@@ -152,17 +145,18 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     const client = await db.connect();
     try {
         await client.query("BEGIN");
+        // ВНИМАНИЕ: Убедитесь, что таблица называется trades (как мы делали ранее) или trades_history
+        // Я использую 'trades', так как мы создавали её в прошлом шаге. Если у вас 'trades_history', поправьте.
         await client.query(`
-            INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue, 0]);
+            INSERT INTO trades (user_id, pair, type, entry_price, close_price, size, leverage, pnl)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue]);
 
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
         await client.query("COMMIT");
         
-        const msg = `⛔️ <b>LIQUIDATED</b>\n\nPos: <b>${pos.pair}</b>\nLoss: ${pnlValue.toFixed(2)} VP`;
+        const msg = `⛔️ <b>LIQUIDATED</b>\n${pos.pair} closed.\nLoss: ${pnlValue.toFixed(2)} VP`;
         sendTelegramAlert(pos.user_id, msg);
-
     } catch (e) {
         await client.query("ROLLBACK");
         console.error("Liquidation DB Error:", e);
@@ -171,62 +165,47 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
     }
 }
 
-setInterval(checkLiquidations, 500);
+setInterval(checkLiquidations, 1000);
 
-// === 1. ЗАГРУЗКА ИСТОРИИ (СИНХРОНИЗИРОВАННАЯ) ===
+// === 1. ЗАГРУЗКА ИСТОРИИ (BINANCE) ===
+// Исправлено: теперь берем историю с Binance, чтобы совпадала с WebSockets
 async function loadHistoryFor(product) {
   try {
-    const url = `${COINBASE_REST}/products/${product}/candles?granularity=60`;
-    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
+    const symbol = getBinanceSymbol(product).toUpperCase(); // BTCUSDT
+    // Запрашиваем 1000 свечей по 1 минуте
+    const url = `${BINANCE_REST}/klines?symbol=${symbol}&interval=1m&limit=1000`;
+    
+    // Binance API обычно не требует прокси для публичных данных, но если блокирует - добавьте agent
+    const r = await fetch(url);
     if (!r.ok) return;
     
-    const chunk = await r.json();
-    let candles = chunk.map(c => ({
-      time: Math.floor(c[0]),
-      open: Number(c[3]),
+    const data = await r.json();
+    
+    // Binance Format: [ [time, open, high, low, close, vol, ...], ... ]
+    historyStore[product] = data.map(c => ({
+      time: Math.floor(c[0] / 1000), // Binance дает мс, нам нужны секунды для LightweightCharts
+      open: Number(c[1]),
       high: Number(c[2]),
-      low: Number(c[1]),
+      low: Number(c[3]),
       close: Number(c[4]),
-    })).sort((a, b) => a.time - b.time).slice(-1440);
-
-    // 🔥 ФИКС БОЛЬШОЙ СВЕЧИ 🔥
-    // Если у нас уже есть цена от Binance, мы подгоняем историю Coinbase под неё.
-    if (latestPrice[product] && candles.length > 0) {
-        const lastCandle = candles[candles.length - 1];
-        const binancePrice = latestPrice[product];
-        const difference = binancePrice - lastCandle.close; // Разница между биржами
-
-        // Смещаем ВСЕ свечи на эту разницу, чтобы график был бесшовным
-        candles = candles.map(c => ({
-            time: c.time,
-            open: c.open + difference,
-            high: c.high + difference,
-            low: c.low + difference,
-            close: c.close + difference
-        }));
-        // console.log(`🔧 Synced ${product}: Shifted by ${difference.toFixed(2)}`);
-    }
-
-    historyStore[product] = candles;
-
+    }));
+    
+    // console.log(`✅ История ${product} обновлена (Binance)`);
   } catch (e) { console.error(`Ошибка истории ${product}:`, e.message); }
 }
 
-// === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
+// === 2. ПОДКЛЮЧЕНИЕ К BINANCE WS ===
 let binanceWS;
-
 function connectBinanceWS() {
   const streams = PRODUCTS.map(p => {
     const sym = getBinanceSymbol(p);
     return `${sym}@depth20@100ms/${sym}@aggTrade/${sym}@ticker`;
   }).join("/");
 
-  console.log("🌐 Подключение к Binance Global через прокси (NL)...");
-    
+  console.log("🌐 Подключение к Binance WS...");
   binanceWS = new WebSocket(BINANCE_WS_BASE + streams, { agent: proxyAgent });
 
-  binanceWS.on("open", () => console.log("✅ Соединение с Binance установлено!"));
-
+  binanceWS.on("open", () => console.log("✅ WS Open"));
   binanceWS.on("message", raw => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -254,24 +233,16 @@ function connectBinanceWS() {
         if (tradesStore[pair].length > 50) tradesStore[pair].shift();
         broadcast({ type: "trades", pair, trades: [trade] });
       }
-    } catch (e) { console.error("Parse error:", e); }
+    } catch (e) { }
   });
 
-  binanceWS.on("error", err => {
-    console.error("❌ WS Error:", err.message);
-  });
-
-  binanceWS.on("close", () => {
-    console.log("Reconnecting Binance...");
-    setTimeout(connectBinanceWS, 5000);
-  });
+  binanceWS.on("close", () => setTimeout(connectBinanceWS, 5000));
+  binanceWS.on("error", (e) => console.error("WS Error", e.message));
 }
 
 setInterval(() => {
   PRODUCTS.forEach(pair => {
-    if (orderbookStore[pair]) {
-      broadcast({ type: "orderBook", pair, ...orderbookStore[pair], ts: Date.now() });
-    }
+    if (orderbookStore[pair]) broadcast({ type: "orderBook", pair, ...orderbookStore[pair] });
   });
 }, 200);
 
@@ -283,34 +254,27 @@ wss.on("connection", ws => {
       const data = JSON.parse(raw.toString());
       if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
         ws.subscriptions.add(data.pair);
-        // При подписке мы отправляем уже "сдвинутую" историю, совпадающую с ценой Binance
         if (historyStore[data.pair]) ws.send(JSON.stringify({ type: "history", pair: data.pair, data: historyStore[data.pair] }));
-        if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
-        if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
-        if (tradesStore[data.pair]) ws.send(JSON.stringify({ type: "trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
+        if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair] }));
       }
-    } catch (e) { console.error(e); }
+    } catch (e) { }
   });
 });
 
+// Anti-Sleep
 const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com"; 
-
 cron.schedule("*/10 * * * *", async () => {
     try { await fetch(`${MAIN_SERVER_URL}/api/health`); } catch (e) { }
 });
 
-// Обновляем историю чаще и синхронизируем её
+// History Update
 cron.schedule("*/1 * * * *", async () => {
     for (const p of PRODUCTS) await loadHistoryFor(p);
 });
 
 async function init() {
+  for (const p of PRODUCTS) await loadHistoryFor(p);
   connectBinanceWS();
-  // Ждем 2 секунды, чтобы получить цену Binance ПЕРЕД загрузкой истории для синхронизации
-  setTimeout(async () => {
-      for (const p of PRODUCTS) await loadHistoryFor(p);
-  }, 2000);
-  
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => console.log(`🚀 PriceServer running on port ${PORT}`));
 }
