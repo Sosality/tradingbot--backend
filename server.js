@@ -30,12 +30,23 @@ const DATABASE_URL = "postgresql://neondb_owner:npg_igxGcyUQmX52@ep-ancient-sky-
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TIMEFRAMES = [60, 300, 900, 3600, 21600, 86400]; // 1m, 5m, 15m, 1h, 6h, 1d
 
+// === CANDLES/HISTORY SETTINGS ===
+// Coinbase candle endpoint returns up to 300 candles per request.
+const COINBASE_MAX_CANDLES_PER_REQUEST = 300;
+// Client mentioned it initially loads ~1400 candles.
+const INITIAL_HISTORY_CANDLES = 1400;
+// Memory cap per (pair,timeframe)
+const MAX_CACHED_CANDLES = 20000;
+
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 const historyStore = {};
 const orderbookStore = {};
 const tradesStore = {};
 const latestPrice = {};
+
+// Prevent multiple simultaneous Coinbase backfills for the same (pair,timeframe)
+const historyLocks = new Map();
 
 // === ПОДКЛЮЧЕНИЕ К БД ===
 const db = new Pool({
@@ -48,6 +59,48 @@ db.connect().then(() => console.log("✅ Liquidation Engine Connected")).catch(e
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getBinanceSymbol(product) {
     return product.replace("-", "").toLowerCase() + "t";
+}
+
+function normalizeGranularity(granularity) {
+    const g = Number(granularity);
+    return TIMEFRAMES.includes(g) ? g : 60;
+}
+
+function ensureHistoryBucket(product, granularity) {
+    if (!historyStore[product]) historyStore[product] = {};
+    if (!historyStore[product][granularity]) historyStore[product][granularity] = [];
+    return historyStore[product][granularity];
+}
+
+function mergeCandles(existing, incoming) {
+    if (!incoming || incoming.length === 0) return existing;
+
+    const map = new Map();
+    for (const c of existing) map.set(c.time, c);
+    for (const c of incoming) map.set(c.time, c); // incoming overwrites
+
+    const merged = Array.from(map.values()).sort((a, b) => a.time - b.time);
+    if (merged.length > MAX_CACHED_CANDLES) {
+        // Keep the most recent MAX_CACHED_CANDLES (prevents unbounded memory usage)
+        return merged.slice(-MAX_CACHED_CANDLES);
+    }
+    return merged;
+}
+
+function withHistoryLock(product, granularity, fn) {
+    const key = `${product}:${granularity}`;
+    const prev = historyLocks.get(key) || Promise.resolve();
+
+    // Chain tasks sequentially
+    const next = prev
+        .catch(() => {})
+        .then(fn)
+        .finally(() => {
+            if (historyLocks.get(key) === next) historyLocks.delete(key);
+        });
+
+    historyLocks.set(key, next);
+    return next;
 }
 
 function getCoinbaseSymbol(binanceStreamName) {
@@ -202,25 +255,94 @@ async function executeLiquidation(pos, exitPrice, size, pnlValue) {
 setInterval(checkLiquidations, 500);
 
 // === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
-async function loadHistoryFor(product, granularity = 60) {
+async function fetchCoinbaseCandlesPage(product, granularity, endSec) {
     try {
-        const url = `${COINBASE_REST}/products/${product}/candles?granularity=${granularity}`;
+        const end = new Date(endSec * 1000);
+        const start = new Date((endSec - (granularity * COINBASE_MAX_CANDLES_PER_REQUEST)) * 1000);
+
+        const url = `${COINBASE_REST}/products/${product}/candles` +
+            `?granularity=${granularity}` +
+            `&start=${encodeURIComponent(start.toISOString())}` +
+            `&end=${encodeURIComponent(end.toISOString())}`;
+
         const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
         if (!r.ok) return;
         const chunk = await r.json();
 
-        if (!historyStore[product]) historyStore[product] = {};
+        // Coinbase returns [ time, low, high, open, close, volume ]
+        return chunk
+            .map(c => ({
+                time: Math.floor(c[0]),
+                open: Number(c[3]),
+                high: Number(c[2]),
+                low: Number(c[1]),
+                close: Number(c[4]),
+            }))
+            .sort((a, b) => a.time - b.time);
+    } catch (e) {
+        console.error(`Ошибка истории ${product} (${granularity}s):`, e.message);
+        return;
+    }
+}
 
-        historyStore[product][granularity] = chunk.map(c => ({
-            time: Math.floor(c[0]),
-            open: Number(c[3]),
-            high: Number(c[2]),
-            low: Number(c[1]),
-            close: Number(c[4]),
-        })).sort((a, b) => a.time - b.time);
+async function refreshLatestHistory(product, granularity = 60) {
+    const g = normalizeGranularity(granularity);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const page = await fetchCoinbaseCandlesPage(product, g, nowSec);
+    if (!page || page.length === 0) return;
 
-        // console.log(`✅ История ${product} (${granularity}s) обновлена`);
-    } catch (e) { console.error(`Ошибка истории ${product} (${granularity}s):`, e.message); }
+    const existing = ensureHistoryBucket(product, g);
+    historyStore[product][g] = mergeCandles(existing, page);
+}
+
+async function ensureHistoryLength(product, granularity = 60, minCandles = INITIAL_HISTORY_CANDLES) {
+    const g = normalizeGranularity(granularity);
+
+    await refreshLatestHistory(product, g);
+    ensureHistoryBucket(product, g);
+
+    let arr = historyStore[product][g];
+    // Backfill older candles until we have enough for initial load
+    // Coinbase is paginated by time ranges; each call gives up to 300 candles.
+    let safetyPages = 0;
+    while (arr.length < minCandles && safetyPages < 20 && arr.length > 0) {
+        safetyPages++;
+        const oldest = arr[0].time;
+        const endSec = oldest - 1;
+        const page = await fetchCoinbaseCandlesPage(product, g, endSec);
+        if (!page || page.length === 0) break;
+        arr = mergeCandles(arr, page);
+        historyStore[product][g] = arr;
+
+        // If we didn't extend the left edge, stop (prevents infinite loop on API quirks)
+        if (arr[0].time >= oldest) break;
+    }
+}
+
+async function ensureHistoryBefore(product, granularity, untilSec) {
+    const g = normalizeGranularity(granularity);
+    ensureHistoryBucket(product, g);
+
+    let arr = historyStore[product][g];
+    if (arr.length === 0) {
+        await ensureHistoryLength(product, g, INITIAL_HISTORY_CANDLES);
+        arr = historyStore[product][g];
+        if (arr.length === 0) return;
+    }
+
+    // If the client requests older than our current oldest, backfill more pages.
+    let safetyPages = 0;
+    while (arr.length > 0 && arr[0].time >= untilSec && safetyPages < 20) {
+        safetyPages++;
+        const oldest = arr[0].time;
+        const endSec = oldest - 1;
+        const page = await fetchCoinbaseCandlesPage(product, g, endSec);
+        if (!page || page.length === 0) break;
+        arr = mergeCandles(arr, page);
+        historyStore[product][g] = arr;
+
+        if (arr[0].time >= oldest) break;
+    }
 }
 
 // === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
@@ -297,32 +419,25 @@ wss.on("connection", ws => {
             // SUBSCRIBE / CHANGE TIMEFRAME
             if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
                 ws.subscriptions.add(data.pair);
-                const granularity = data.timeframe || 60; // Default 1m
+                const granularity = normalizeGranularity(data.timeframe || 60); // Default 1m
 
                 // Send History
-                if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
-                    // Send last 300 candles initially
-                    const fullHistory = historyStore[data.pair][granularity];
-                    const initialData = fullHistory.slice(-300);
-                    ws.send(JSON.stringify({
-                        type: "history",
-                        pair: data.pair,
-                        data: initialData,
-                        timeframe: granularity
-                    }));
-                } else {
-                     // Try to load on demand if missing
-                     await loadHistoryFor(data.pair, granularity);
-                     if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
-                        const fullHistory = historyStore[data.pair][granularity];
-                        ws.send(JSON.stringify({
-                            type: "history",
-                            pair: data.pair,
-                            data: fullHistory.slice(-300),
-                            timeframe: granularity
-                        }));
-                     }
-                }
+                await withHistoryLock(data.pair, granularity, async () => {
+                    // Ensure we have enough candles for initial display
+                    await ensureHistoryLength(data.pair, granularity, INITIAL_HISTORY_CANDLES);
+                });
+
+                const fullHistory = (historyStore[data.pair] && historyStore[data.pair][granularity])
+                    ? historyStore[data.pair][granularity]
+                    : [];
+
+                const initialData = fullHistory.slice(-INITIAL_HISTORY_CANDLES);
+                ws.send(JSON.stringify({
+                    type: "history",
+                    pair: data.pair,
+                    data: initialData,
+                    timeframe: granularity
+                }));
 
                 if (latestPrice[data.pair]) ws.send(JSON.stringify({ type: "price", pair: data.pair, price: latestPrice[data.pair], ts: Date.now() }));
                 if (orderbookStore[data.pair]) ws.send(JSON.stringify({ type: "orderBook", pair: data.pair, ...orderbookStore[data.pair] }));
@@ -331,38 +446,31 @@ wss.on("connection", ws => {
 
             // LOAD MORE HISTORY (LAZY LOADING)
             if (data.type === "loadMore" && PRODUCTS.includes(data.pair)) {
-                const granularity = data.timeframe || 60;
+                const granularity = normalizeGranularity(data.timeframe || 60);
                 const oldestTime = data.until; // Timestamp of the leftmost visible candle
 
                 console.log(`📥 loadMore request: ${data.pair} @ ${granularity}s, before ${new Date(oldestTime * 1000).toISOString()}`);
 
-                if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
-                    const fullHistory = historyStore[data.pair][granularity];
-                    // Find candles older than oldestTime
-                    // Since array is sorted by time ascending, filter or find index
-                    const olderCandles = fullHistory.filter(c => c.time < oldestTime);
-                    // Take a chunk, e.g., 300 previous candles
-                    const chunk = olderCandles.slice(-300);
+                await withHistoryLock(data.pair, granularity, async () => {
+                    await ensureHistoryBefore(data.pair, granularity, oldestTime);
+                });
 
-                    console.log(`📤 Found ${chunk.length} older candles to send back`);
+                const fullHistory = (historyStore[data.pair] && historyStore[data.pair][granularity])
+                    ? historyStore[data.pair][granularity]
+                    : [];
 
-                    // ALWAYS send response (even if empty) so client knows to stop waiting
-                    ws.send(JSON.stringify({
-                        type: "moreHistory",
-                        pair: data.pair,
-                        data: chunk,
-                        timeframe: granularity
-                    }));
-                } else {
-                    // Data not loaded yet, send empty response
-                    console.log(`⚠️ History not available for ${data.pair} @ ${granularity}s`);
-                    ws.send(JSON.stringify({
-                        type: "moreHistory",
-                        pair: data.pair,
-                        data: [],
-                        timeframe: granularity
-                    }));
-                }
+                const olderCandles = fullHistory.filter(c => c.time < oldestTime);
+                const chunk = olderCandles.slice(-COINBASE_MAX_CANDLES_PER_REQUEST);
+
+                console.log(`📤 Found ${chunk.length} older candles to send back`);
+
+                // ALWAYS send response (even if empty) so client knows to stop waiting
+                ws.send(JSON.stringify({
+                    type: "moreHistory",
+                    pair: data.pair,
+                    data: chunk,
+                    timeframe: granularity
+                }));
             }
 
         } catch (e) { console.error(e); }
@@ -386,7 +494,10 @@ cron.schedule("*/1 * * * *", async () => {
     // console.log("🔄 Updating Candle History...");
     for (const p of PRODUCTS) {
         for (const tf of TIMEFRAMES) {
-             await loadHistoryFor(p, tf);
+            // Refresh only the latest page, while keeping already backfilled older candles
+            await withHistoryLock(p, tf, async () => {
+                await refreshLatestHistory(p, tf);
+            });
         }
     }
 });
@@ -394,7 +505,9 @@ cron.schedule("*/1 * * * *", async () => {
 async function init() {
     for (const p of PRODUCTS) {
         for (const tf of TIMEFRAMES) {
-            await loadHistoryFor(p, tf);
+            await withHistoryLock(p, tf, async () => {
+                await ensureHistoryLength(p, tf, INITIAL_HISTORY_CANDLES);
+            });
         }
     }
     connectBinanceWS();
