@@ -71,147 +71,21 @@ function broadcast(msg) {
     });
 }
 
-// === TELEGRAM ALERT ===
-async function sendTelegramAlert(userId, message) {
-    if (!BOT_TOKEN || !userId) {
-        console.error("⚠️ TG Alert skipped: No Token or User ID");
-        return;
-    }
+// === 🔥 ЗАГРУЗКА ИСТОРИИ (УЛУЧШЕННАЯ) 🔥 ===
 
-    try {
-        const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: userId,
-                text: message,
-                parse_mode: 'HTML'
-            })
-        });
-
-        const data = await response.json();
-
-        if (!data.ok) {
-            console.error(`❌ TELEGRAM API ERROR for User ${userId}: ${data.description}`);
-        } else {
-            console.log(`✅ Message sent to ${userId}`);
-        }
-    } catch (e) {
-        console.error("❌ NETWORK/FETCH ERROR:", e.message);
-    }
-}
-
-let isProcessing = false;
-
-// === 🔥 LIQUIDATION ENGINE 🔥 ===
-async function checkLiquidations() {
-    if (isProcessing || Object.keys(latestPrice).length === 0) return;
-
-    isProcessing = true;
-
-    try {
-        const res = await db.query(`SELECT * FROM positions`);
-
-        if (res.rows.length === 0) {
-            isProcessing = false;
-            return;
-        }
-
-        for (const pos of res.rows) {
-            const currentPrice = latestPrice[pos.pair];
-            if (!currentPrice) continue;
-
-            const entry = Number(pos.entry_price);
-            const size = Number(pos.size);
-            const margin = Number(pos.margin);
-
-            let pnl = 0;
-            const diff = (currentPrice - entry) / entry;
-
-            if (pos.type === "LONG") {
-                pnl = diff * size;
-            } else {
-                pnl = -diff * size;
-            }
-
-            const closeCommission = size * 0.0003;
-            const maintenanceMargin = size * 0.004;
-            const remainingEquity = margin + pnl;
-            const liquidationThreshold = closeCommission + maintenanceMargin;
-
-            // === ЛИКВИДАЦИЯ ===
-            if (remainingEquity <= liquidationThreshold) {
-                console.log(`💀 LIQUIDATING: User ${pos.user_id} | ${pos.pair}`);
-                await executeLiquidation(pos, currentPrice, size, -margin);
-                continue;
-            }
-
-            // === ПРЕДУПРЕЖДЕНИЕ ===
-            const warningThreshold = liquidationThreshold * 1.2;
-
-            if (!pos.warning_sent && remainingEquity <= warningThreshold) {
-                const pnlFormatted = pnl.toFixed(2);
-
-                const msg = `⚠️ <b>MARGIN CALL WARNING</b> ⚠️\n\n` +
-                    `Your position <b>${pos.type} ${pos.pair}</b> (x${pos.leverage}) is at risk!\n\n` +
-                    `📉 PnL: ${pnlFormatted} VP\n` +
-                    `💰 Remaining Equity: ${remainingEquity.toFixed(2)} VP\n` +
-                    `💀 Liquidation at approx: ${liquidationThreshold.toFixed(2)} VP\n\n` +
-                    `System will auto-liquidate if equity drops further.`;
-
-                await sendTelegramAlert(pos.user_id, msg);
-                await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
-                console.log(`⚠️ Warning sent to user ${pos.user_id}`);
-            }
-        }
-    } catch (e) {
-        console.error("Liquidation Loop Error:", e.message);
-    } finally {
-        isProcessing = false;
-    }
-}
-
-async function executeLiquidation(pos, exitPrice, size, pnlValue) {
-    const client = await db.connect();
-    try {
-        await client.query("BEGIN");
-        await client.query(`
-            INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue, 0]);
-
-        await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
-        await client.query("COMMIT");
-
-        const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
-            `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
-            `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
-            `Price reached liquidation level.`;
-
-        sendTelegramAlert(pos.user_id, msg);
-
-    } catch (e) {
-        await client.query("ROLLBACK");
-        console.error("Liquidation DB Error:", e);
-    } finally {
-        client.release();
-    }
-}
-
-setInterval(checkLiquidations, 500);
-
-// === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
+// 1. Обычная загрузка "свежих" данных (последние 300 свечей)
 async function loadHistoryFor(product, granularity = 60) {
     try {
+        // Coinbase отдает максимум 300 свечей за раз
         const url = `${COINBASE_REST}/products/${product}/candles?granularity=${granularity}`;
         const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
         if (!r.ok) return;
         const chunk = await r.json();
 
         if (!historyStore[product]) historyStore[product] = {};
-
-        historyStore[product][granularity] = chunk.map(c => ({
+        
+        // Преобразуем
+        const newCandles = chunk.map(c => ({
             time: Math.floor(c[0]),
             open: Number(c[3]),
             high: Number(c[2]),
@@ -219,9 +93,71 @@ async function loadHistoryFor(product, granularity = 60) {
             close: Number(c[4]),
         })).sort((a, b) => a.time - b.time);
 
-        // console.log(`✅ История ${product} (${granularity}s) обновлена`);
+        // Мержим с тем, что уже есть (чтобы не потерять старые данные при обновлении)
+        if (!historyStore[product][granularity]) {
+            historyStore[product][granularity] = newCandles;
+        } else {
+            // Добавляем только новые (правые), если их нет
+            const existing = historyStore[product][granularity];
+            const lastTime = existing[existing.length - 1].time;
+            const freshCandles = newCandles.filter(c => c.time > lastTime);
+            historyStore[product][granularity] = [...existing, ...freshCandles];
+        }
+
     } catch (e) { console.error(`Ошибка истории ${product} (${granularity}s):`, e.message); }
 }
+
+// 2. Загрузка СТАРЫХ данных (Пагинация назад)
+async function fetchMoreHistoryFromCoinbase(product, granularity, beforeTime) {
+    try {
+        // Coinbase API принимает start и end в ISO формате
+        // end = beforeTime (мы хотим данные ДО этого времени)
+        // start = end - (300 свечей * granularity)
+        
+        const endTime = new Date(beforeTime * 1000).toISOString();
+        const startTime = new Date((beforeTime - (300 * granularity)) * 1000).toISOString();
+
+        const url = `${COINBASE_REST}/products/${product}/candles?granularity=${granularity}&start=${startTime}&end=${endTime}`;
+        
+        console.log(`🌐 Fetching external history: ${product} ${granularity}s | ${startTime} -> ${endTime}`);
+
+        const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
+        
+        if (!r.ok) {
+            console.error(`External fetch failed: ${r.statusText}`);
+            return [];
+        }
+        
+        const chunk = await r.json();
+        if (!Array.isArray(chunk) || chunk.length === 0) return [];
+
+        const oldCandles = chunk.map(c => ({
+            time: Math.floor(c[0]),
+            open: Number(c[3]),
+            high: Number(c[2]),
+            low: Number(c[1]),
+            close: Number(c[4]),
+        })).sort((a, b) => a.time - b.time);
+
+        // Вставляем эти данные в начало нашего кэша, чтобы потом не качать снова
+        if (historyStore[product] && historyStore[product][granularity]) {
+            // Фильтруем дубликаты на всякий случай
+            const existing = historyStore[product][granularity];
+            const firstExistingTime = existing[0].time;
+            const uniqueOld = oldCandles.filter(c => c.time < firstExistingTime);
+            
+            historyStore[product][granularity] = [...uniqueOld, ...existing];
+            return uniqueOld;
+        }
+
+        return oldCandles;
+
+    } catch (e) {
+        console.error("Error fetching more history:", e.message);
+        return [];
+    }
+}
+
 
 // === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
 let binanceWS;
@@ -301,7 +237,7 @@ wss.on("connection", ws => {
 
                 // Send History
                 if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
-                    // Send last 300 candles initially
+                    // Отправляем последние 300 свечей, чтобы не грузить лишнее сразу
                     const fullHistory = historyStore[data.pair][granularity];
                     const initialData = fullHistory.slice(-300);
                     ws.send(JSON.stringify({
@@ -336,52 +272,42 @@ wss.on("connection", ws => {
 
                 console.log(`📥 loadMore request: ${data.pair} @ ${granularity}s, before ${new Date(oldestTime * 1000).toISOString()}`);
 
+                let chunk = [];
+
+                // 1. Проверяем кэш
                 if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
                     const fullHistory = historyStore[data.pair][granularity];
-                    // Find candles older than oldestTime
-                    // Since array is sorted by time ascending, filter or find index
-                    const olderCandles = fullHistory.filter(c => c.time < oldestTime);
-                    // Take a chunk, e.g., 300 previous candles
-                    const chunk = olderCandles.slice(-300);
-
-                    console.log(`📤 Found ${chunk.length} older candles to send back`);
-
-                    // ALWAYS send response (even if empty) so client knows to stop waiting
-                    ws.send(JSON.stringify({
-                        type: "moreHistory",
-                        pair: data.pair,
-                        data: chunk,
-                        timeframe: granularity
-                    }));
-                } else {
-                    // Data not loaded yet, send empty response
-                    console.log(`⚠️ History not available for ${data.pair} @ ${granularity}s`);
-                    ws.send(JSON.stringify({
-                        type: "moreHistory",
-                        pair: data.pair,
-                        data: [],
-                        timeframe: granularity
-                    }));
+                    // Ищем свечи в кэше, которые старше (меньше) запрошенного времени
+                    const cachedOlder = fullHistory.filter(c => c.time < oldestTime);
+                    
+                    if (cachedOlder.length >= 50) {
+                        // Если в кэше достаточно старых данных, отдаем их
+                        chunk = cachedOlder.slice(-300); // Берем последние 300 из старых
+                        console.log(`📦 Serving ${chunk.length} candles from CACHE`);
+                    }
                 }
+
+                // 2. Если в кэше пусто или мало, качаем извне
+                if (chunk.length === 0) {
+                    console.log(`🌍 Cache empty/insufficient, fetching from Coinbase...`);
+                    chunk = await fetchMoreHistoryFromCoinbase(data.pair, granularity, oldestTime);
+                    console.log(`📥 Fetched ${chunk.length} candles from EXTERNAL API`);
+                }
+
+                // ALWAYS send response
+                ws.send(JSON.stringify({
+                    type: "moreHistory",
+                    pair: data.pair,
+                    data: chunk,
+                    timeframe: granularity
+                }));
             }
 
         } catch (e) { console.error(e); }
     });
 });
 
-// === 🛡️ СИСТЕМА ANTI-SLEEP ===
-const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com";
-
-// 1. Пингуем другой сервер
-cron.schedule("*/10 * * * *", async () => {
-    // console.log("⏰ Anti-Sleep: Pinging Main Server...");
-    try {
-        await fetch(`${MAIN_SERVER_URL}/api/health`);
-    } catch (e) { }
-});
-
-// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
-// Обновляем массив истории свечей каждую минуту
+// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ ===
 cron.schedule("*/1 * * * *", async () => {
     // console.log("🔄 Updating Candle History...");
     for (const p of PRODUCTS) {
