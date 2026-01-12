@@ -336,26 +336,68 @@ wss.on("connection", ws => {
 
                 console.log(`📥 loadMore request: ${data.pair} @ ${granularity}s, before ${new Date(oldestTime * 1000).toISOString()}`);
 
-                if (historyStore[data.pair] && historyStore[data.pair][granularity]) {
-                    const fullHistory = historyStore[data.pair][granularity];
-                    // Find candles older than oldestTime
-                    // Since array is sorted by time ascending, filter or find index
-                    const olderCandles = fullHistory.filter(c => c.time < oldestTime);
-                    // Take a chunk, e.g., 300 previous candles
-                    const chunk = olderCandles.slice(-300);
+                try {
+                    // Fetch older candles from API using 'end' parameter
+                    // Coinbase API: when end < oldestTime, it returns candles BEFORE that time
+                    const endTimestamp = oldestTime; // This is the unix timestamp of the oldest visible candle
+                    const url = `${COINBASE_REST}/products/${data.pair}/candles?granularity=${granularity}&end=${endTimestamp}`;
 
-                    console.log(`📤 Found ${chunk.length} older candles to send back`);
+                    const r = await fetch(url, { headers: { "User-Agent": "TradeSimBot/1.0" } });
 
-                    // ALWAYS send response (even if empty) so client knows to stop waiting
-                    ws.send(JSON.stringify({
-                        type: "moreHistory",
-                        pair: data.pair,
-                        data: chunk,
-                        timeframe: granularity
-                    }));
-                } else {
-                    // Data not loaded yet, send empty response
-                    console.log(`⚠️ History not available for ${data.pair} @ ${granularity}s`);
+                    if (r.ok) {
+                        const apiChunk = await r.json();
+
+                        // Parse and sort the API response
+                        const olderCandles = apiChunk.map(c => ({
+                            time: Math.floor(c[0]),
+                            open: Number(c[3]),
+                            high: Number(c[2]),
+                            low: Number(c[1]),
+                            close: Number(c[4]),
+                        })).sort((a, b) => a.time - b.time);
+
+                        console.log(`📤 Fetched ${olderCandles.length} older candles from API`);
+
+                        // Merge with existing history in store
+                        if (!historyStore[data.pair]) historyStore[data.pair] = {};
+                        if (!historyStore[data.pair][granularity]) {
+                            historyStore[data.pair][granularity] = [];
+                        }
+
+                        // Merge arrays: keep old data + new data, remove duplicates by time
+                        const mergedMap = new Map();
+
+                        // Add existing candles
+                        historyStore[data.pair][granularity].forEach(c => {
+                            mergedMap.set(c.time, c);
+                        });
+
+                        // Add fetched candles
+                        olderCandles.forEach(c => {
+                            mergedMap.set(c.time, c);
+                        });
+
+                        // Convert back to sorted array
+                        historyStore[data.pair][granularity] = Array.from(mergedMap.values())
+                            .sort((a, b) => a.time - b.time);
+
+                        ws.send(JSON.stringify({
+                            type: "moreHistory",
+                            pair: data.pair,
+                            data: olderCandles,
+                            timeframe: granularity
+                        }));
+                    } else {
+                        console.log(`⚠️ API error for ${data.pair} @ ${granularity}s`);
+                        ws.send(JSON.stringify({
+                            type: "moreHistory",
+                            pair: data.pair,
+                            data: [],
+                            timeframe: granularity
+                        }));
+                    }
+                } catch (e) {
+                    console.error(`❌ loadMore error for ${data.pair}:`, e.message);
                     ws.send(JSON.stringify({
                         type: "moreHistory",
                         pair: data.pair,
