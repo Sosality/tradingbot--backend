@@ -381,12 +381,15 @@ wss.on("connection", ws => {
                         historyStore[data.pair][granularity] = Array.from(mergedMap.values())
                             .sort((a, b) => a.time - b.time);
 
-                        ws.send(JSON.stringify({
+                        const responseMsg = {
                             type: "moreHistory",
                             pair: data.pair,
                             data: olderCandles,
                             timeframe: granularity
-                        }));
+                        };
+
+                        console.log(`📤 Sending moreHistory response: pair=${responseMsg.pair}, candles=${responseMsg.data.length}, timeframe=${responseMsg.timeframe}`);
+                        ws.send(JSON.stringify(responseMsg));
                     } else {
                         console.log(`⚠️ API error for ${data.pair} @ ${granularity}s`);
                         ws.send(JSON.stringify({
