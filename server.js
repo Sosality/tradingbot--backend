@@ -196,7 +196,7 @@ async function checkLiquidations() {
             // === ЛИКВИДАЦИЯ ===
             if (remainingEquity <= liquidationThreshold) {
                 console.log(`💀 LIQUIDATING: User ${pos.user_id} | ${pos.pair}`);
-                await executeLiquidation(pos, currentPrice, size, -margin);
+                await executeLiquidation(pos, currentPrice);
                 continue;
             }
 
@@ -225,21 +225,34 @@ async function checkLiquidations() {
     }
 }
 
-async function executeLiquidation(pos, exitPrice, size, pnlValue) {
+async function executeLiquidation(pos, exitPrice) {
     const client = await db.connect();
     try {
+        const size = Number(pos.size);
+        const margin = Number(pos.margin);
+
+        // Комиссия закрытия (0.03% от notional/size)
+        const closeCommission = size * 0.0003;
+
+        // Мы моделируем liquidation как: вся маржа сгорает (на баланс ничего не возвращаем).
+        // Чтобы история была консистентной с totalReturn=0:
+        // totalReturn = margin + pnl - commission = 0 => pnl = commission - margin
+        // pnl здесь — "gross" (без комиссии), а commission — отдельным полем.
+        const pnlGross = closeCommission - margin;
+
         await client.query("BEGIN");
         await client.query(`
             INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlValue, 0]);
+        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlGross, closeCommission]);
 
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
         await client.query("COMMIT");
 
         const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
             `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
-            `📉 Loss: ${pnlValue.toFixed(2)} VP\n` +
+            `📉 Loss: ${(-margin).toFixed(2)} VP\n` +
+            `💸 Fee: ${closeCommission.toFixed(2)} VP\n` +
             `Price reached liquidation level.`;
 
         sendTelegramAlert(pos.user_id, msg);
