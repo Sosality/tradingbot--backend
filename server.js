@@ -31,11 +31,8 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const TIMEFRAMES = [60, 300, 900, 3600, 21600, 86400]; // 1m, 5m, 15m, 1h, 6h, 1d
 
 // === CANDLES/HISTORY SETTINGS ===
-// Coinbase candle endpoint returns up to 300 candles per request.
 const COINBASE_MAX_CANDLES_PER_REQUEST = 300;
-// Client mentioned it initially loads ~1400 candles.
 const INITIAL_HISTORY_CANDLES = 1400;
-// Memory cap per (pair,timeframe)
 const MAX_CACHED_CANDLES = 20000;
 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
@@ -45,7 +42,6 @@ const orderbookStore = {};
 const tradesStore = {};
 const latestPrice = {};
 
-// Prevent multiple simultaneous Coinbase backfills for the same (pair,timeframe)
 const historyLocks = new Map();
 
 // === ПОДКЛЮЧЕНИЕ К БД ===
@@ -77,11 +73,10 @@ function mergeCandles(existing, incoming) {
 
     const map = new Map();
     for (const c of existing) map.set(c.time, c);
-    for (const c of incoming) map.set(c.time, c); // incoming overwrites
+    for (const c of incoming) map.set(c.time, c);
 
     const merged = Array.from(map.values()).sort((a, b) => a.time - b.time);
     if (merged.length > MAX_CACHED_CANDLES) {
-        // Keep the most recent MAX_CACHED_CANDLES (prevents unbounded memory usage)
         return merged.slice(-MAX_CACHED_CANDLES);
     }
     return merged;
@@ -91,7 +86,6 @@ function withHistoryLock(product, granularity, fn) {
     const key = `${product}:${granularity}`;
     const prev = historyLocks.get(key) || Promise.resolve();
 
-    // Chain tasks sequentially
     const next = prev
         .catch(() => {})
         .then(fn)
@@ -156,6 +150,144 @@ async function sendTelegramAlert(userId, message) {
 }
 
 let isProcessing = false;
+
+// =============================================
+// === 🎯 TP/SL ENGINE (НОВОЕ!) ===
+// =============================================
+
+let isTpSlProcessing = false;
+
+async function checkTpSl() {
+    if (isTpSlProcessing || Object.keys(latestPrice).length === 0) return;
+    isTpSlProcessing = true;
+
+    try {
+        // Берём только позиции у которых есть TP или SL
+        const res = await db.query(
+            `SELECT * FROM positions WHERE take_profit IS NOT NULL OR stop_loss IS NOT NULL`
+        );
+
+        if (res.rows.length === 0) {
+            isTpSlProcessing = false;
+            return;
+        }
+
+        for (const pos of res.rows) {
+            const currentPrice = latestPrice[pos.pair];
+            if (!currentPrice) continue;
+
+            const tp = pos.take_profit ? Number(pos.take_profit) : null;
+            const sl = pos.stop_loss ? Number(pos.stop_loss) : null;
+
+            let triggered = null; // 'tp' | 'sl' | null
+            let exitPrice = currentPrice;
+
+            if (pos.type === "LONG") {
+                // TP: цена >= take_profit
+                if (tp !== null && currentPrice >= tp) {
+                    triggered = "tp";
+                    exitPrice = tp; // Исполняем точно по TP цене
+                }
+                // SL: цена <= stop_loss
+                else if (sl !== null && currentPrice <= sl) {
+                    triggered = "sl";
+                    exitPrice = sl;
+                }
+            } else {
+                // SHORT
+                // TP: цена <= take_profit
+                if (tp !== null && currentPrice <= tp) {
+                    triggered = "tp";
+                    exitPrice = tp;
+                }
+                // SL: цена >= stop_loss
+                else if (sl !== null && currentPrice >= sl) {
+                    triggered = "sl";
+                    exitPrice = sl;
+                }
+            }
+
+            if (triggered) {
+                console.log(`🎯 TP/SL TRIGGERED: ${triggered.toUpperCase()} for User ${pos.user_id} | ${pos.pair} @ ${exitPrice}`);
+                await executeTpSlClose(pos, exitPrice, triggered);
+            }
+        }
+    } catch (e) {
+        console.error("TP/SL Loop Error:", e.message);
+    } finally {
+        isTpSlProcessing = false;
+    }
+}
+
+async function executeTpSlClose(pos, exitPrice, triggerType) {
+    const client = await db.connect();
+    try {
+        const entry = Number(pos.entry_price);
+        const size = Number(pos.size);
+        const margin = Number(pos.margin);
+
+        // PnL
+        const diff = (exitPrice - entry) / entry;
+        let pnl = pos.type === "LONG" ? diff * size : -diff * size;
+
+        // Комиссия закрытия
+        const closeCommission = size * 0.0003;
+
+        // Итого возврат
+        const totalReturn = margin + pnl - closeCommission;
+        const balanceReturn = Math.max(0, totalReturn); // Не может быть отрицательным
+
+        await client.query("BEGIN");
+
+        // Записываем в историю сделок
+        await client.query(`
+            INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnl, closeCommission]);
+
+        // Возвращаем средства на баланс
+        if (balanceReturn > 0) {
+            await client.query(
+                `UPDATE users SET balance = balance + $1 WHERE telegram_id = $2`,
+                [balanceReturn, pos.user_id]
+            );
+        }
+
+        // Удаляем позицию
+        await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
+
+        await client.query("COMMIT");
+
+        // Telegram уведомление
+        const isTp = triggerType === "tp";
+        const emoji = isTp ? "🎯✅" : "🛑";
+        const label = isTp ? "TAKE PROFIT HIT" : "STOP LOSS HIT";
+        const pnlSign = pnl >= 0 ? "+" : "";
+
+        const msg =
+            `${emoji} <b>${label}</b>\n\n` +
+            `Pair: <b>${pos.pair}</b>\n` +
+            `Type: <b>${pos.type}</b> x${pos.leverage}\n` +
+            `Entry: <b>${entry.toFixed(2)}</b>\n` +
+            `Exit: <b>${exitPrice.toFixed(2)}</b>\n\n` +
+            `${pnlSign}${pnl.toFixed(2)} VP (fee: ${closeCommission.toFixed(2)})\n` +
+            `💰 Returned: <b>${balanceReturn.toFixed(2)} VP</b>`;
+
+        sendTelegramAlert(pos.user_id, msg);
+
+        console.log(`${emoji} ${label}: User ${pos.user_id} | ${pos.pair} | PnL: ${pnl.toFixed(2)}`);
+
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("TP/SL Close DB Error:", e.message);
+    } finally {
+        client.release();
+    }
+}
+
+// Проверяем TP/SL каждые 500ms (параллельно с ликвидациями)
+setInterval(checkTpSl, 500);
+
 
 // === 🔥 LIQUIDATION ENGINE 🔥 ===
 async function checkLiquidations() {
@@ -231,13 +363,7 @@ async function executeLiquidation(pos, exitPrice) {
         const size = Number(pos.size);
         const margin = Number(pos.margin);
 
-        // Комиссия закрытия (0.03% от notional/size)
         const closeCommission = size * 0.0003;
-
-        // Мы моделируем liquidation как: вся маржа сгорает (на баланс ничего не возвращаем).
-        // Чтобы история была консистентной с totalReturn=0:
-        // totalReturn = margin + pnl - commission = 0 => pnl = commission - margin
-        // pnl здесь — "gross" (без комиссии), а commission — отдельным полем.
         const pnlGross = closeCommission - margin;
 
         await client.query("BEGIN");
@@ -282,7 +408,6 @@ async function fetchCoinbaseCandlesPage(product, granularity, endSec) {
         if (!r.ok) return;
         const chunk = await r.json();
 
-        // Coinbase returns [ time, low, high, open, close, volume ]
         return chunk
             .map(c => ({
                 time: Math.floor(c[0]),
@@ -315,8 +440,6 @@ async function ensureHistoryLength(product, granularity = 60, minCandles = INITI
     ensureHistoryBucket(product, g);
 
     let arr = historyStore[product][g];
-    // Backfill older candles until we have enough for initial load
-    // Coinbase is paginated by time ranges; each call gives up to 300 candles.
     let safetyPages = 0;
     while (arr.length < minCandles && safetyPages < 20 && arr.length > 0) {
         safetyPages++;
@@ -327,7 +450,6 @@ async function ensureHistoryLength(product, granularity = 60, minCandles = INITI
         arr = mergeCandles(arr, page);
         historyStore[product][g] = arr;
 
-        // If we didn't extend the left edge, stop (prevents infinite loop on API quirks)
         if (arr[0].time >= oldest) break;
     }
 }
@@ -343,7 +465,6 @@ async function ensureHistoryBefore(product, granularity, untilSec) {
         if (arr.length === 0) return;
     }
 
-    // If the client requests older than our current oldest, backfill more pages.
     let safetyPages = 0;
     while (arr.length > 0 && arr[0].time >= untilSec && safetyPages < 20) {
         safetyPages++;
@@ -432,11 +553,9 @@ wss.on("connection", ws => {
             // SUBSCRIBE / CHANGE TIMEFRAME
             if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
                 ws.subscriptions.add(data.pair);
-                const granularity = normalizeGranularity(data.timeframe || 60); // Default 1m
+                const granularity = normalizeGranularity(data.timeframe || 60);
 
-                // Send History
                 await withHistoryLock(data.pair, granularity, async () => {
-                    // Ensure we have enough candles for initial display
                     await ensureHistoryLength(data.pair, granularity, INITIAL_HISTORY_CANDLES);
                 });
 
@@ -460,7 +579,7 @@ wss.on("connection", ws => {
             // LOAD MORE HISTORY (LAZY LOADING)
             if (data.type === "loadMore" && PRODUCTS.includes(data.pair)) {
                 const granularity = normalizeGranularity(data.timeframe || 60);
-                const oldestTime = data.until; // Timestamp of the leftmost visible candle
+                const oldestTime = data.until;
 
                 console.log(`📥 loadMore request: ${data.pair} @ ${granularity}s, before ${new Date(oldestTime * 1000).toISOString()}`);
 
@@ -477,7 +596,6 @@ wss.on("connection", ws => {
 
                 console.log(`📤 Found ${chunk.length} older candles to send back`);
 
-                // ALWAYS send response (even if empty) so client knows to stop waiting
                 ws.send(JSON.stringify({
                     type: "moreHistory",
                     pair: data.pair,
@@ -493,21 +611,16 @@ wss.on("connection", ws => {
 // === 🛡️ СИСТЕМА ANTI-SLEEP ===
 const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com";
 
-// 1. Пингуем другой сервер
 cron.schedule("*/10 * * * *", async () => {
-    // console.log("⏰ Anti-Sleep: Pinging Main Server...");
     try {
         await fetch(`${MAIN_SERVER_URL}/api/health`);
     } catch (e) { }
 });
 
-// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
-// Обновляем массив истории свечей каждую минуту
+// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ ===
 cron.schedule("*/1 * * * *", async () => {
-    // console.log("🔄 Updating Candle History...");
     for (const p of PRODUCTS) {
         for (const tf of TIMEFRAMES) {
-            // Refresh only the latest page, while keeping already backfilled older candles
             await withHistoryLock(p, tf, async () => {
                 await refreshLatestHistory(p, tf);
             });
