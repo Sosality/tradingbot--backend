@@ -13,7 +13,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// === 🔥 HEALTH CHECK ROUTE 🔥 ===
 app.get("/health", (req, res) => {
     res.status(200).send("Im Alive");
 });
@@ -21,21 +20,16 @@ app.get("/health", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// === НАСТРОЙКИ ===
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
 const COINBASE_REST = "https://api.exchange.coinbase.com";
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 const PROXY_URL = "http://g4alts:nT6UVMhowL@45.153.162.250:59100";
 const DATABASE_URL = "postgresql://neondb_owner:npg_igxGcyUQmX52@ep-ancient-sky-a9db2z9z-pooler.gwc.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const TIMEFRAMES = [60, 300, 900, 3600, 21600, 86400]; // 1m, 5m, 15m, 1h, 6h, 1d
+const TIMEFRAMES = [60, 300, 900, 3600, 21600, 86400];
 
-// === CANDLES/HISTORY SETTINGS ===
-// Coinbase candle endpoint returns up to 300 candles per request.
 const COINBASE_MAX_CANDLES_PER_REQUEST = 300;
-// Client mentioned it initially loads ~1400 candles.
 const INITIAL_HISTORY_CANDLES = 1400;
-// Memory cap per (pair,timeframe)
 const MAX_CACHED_CANDLES = 20000;
 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
@@ -45,18 +39,15 @@ const orderbookStore = {};
 const tradesStore = {};
 const latestPrice = {};
 
-// Prevent multiple simultaneous Coinbase backfills for the same (pair,timeframe)
 const historyLocks = new Map();
 
-// === ПОДКЛЮЧЕНИЕ К БД ===
 const db = new Pool({
     connectionString: DATABASE_URL,
     ssl: true
 });
 
-db.connect().then(() => console.log("✅ Liquidation Engine Connected")).catch(e => console.error("DB Error:", e.message));
+db.connect().then(() => console.log("✅ Liquidation & TP/SL Engine Connected")).catch(e => console.error("DB Error:", e.message));
 
-// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 function getBinanceSymbol(product) {
     return product.replace("-", "").toLowerCase() + "t";
 }
@@ -77,11 +68,10 @@ function mergeCandles(existing, incoming) {
 
     const map = new Map();
     for (const c of existing) map.set(c.time, c);
-    for (const c of incoming) map.set(c.time, c); // incoming overwrites
+    for (const c of incoming) map.set(c.time, c);
 
     const merged = Array.from(map.values()).sort((a, b) => a.time - b.time);
     if (merged.length > MAX_CACHED_CANDLES) {
-        // Keep the most recent MAX_CACHED_CANDLES (prevents unbounded memory usage)
         return merged.slice(-MAX_CACHED_CANDLES);
     }
     return merged;
@@ -91,7 +81,6 @@ function withHistoryLock(product, granularity, fn) {
     const key = `${product}:${granularity}`;
     const prev = historyLocks.get(key) || Promise.resolve();
 
-    // Chain tasks sequentially
     const next = prev
         .catch(() => {})
         .then(fn)
@@ -124,7 +113,21 @@ function broadcast(msg) {
     });
 }
 
-// === TELEGRAM ALERT ===
+function broadcastTpSlTriggered(userId, orderId, orderType, positionId, triggerPrice, pnl, sizePercent) {
+    const msg = {
+        type: "tpSlTriggered",
+        userId,
+        orderId,
+        orderType,
+        positionId,
+        triggerPrice,
+        pnl,
+        sizePercent,
+        ts: Date.now()
+    };
+    broadcast(msg);
+}
+
 async function sendTelegramAlert(userId, message) {
     if (!BOT_TOKEN || !userId) {
         console.error("⚠️ TG Alert skipped: No Token or User ID");
@@ -157,21 +160,20 @@ async function sendTelegramAlert(userId, message) {
 
 let isProcessing = false;
 
-// === 🔥 LIQUIDATION ENGINE 🔥 ===
-async function checkLiquidations() {
+async function checkLiquidationsAndTpSl() {
     if (isProcessing || Object.keys(latestPrice).length === 0) return;
 
     isProcessing = true;
 
     try {
-        const res = await db.query(`SELECT * FROM positions`);
+        const positionsRes = await db.query(`SELECT * FROM positions`);
 
-        if (res.rows.length === 0) {
+        if (positionsRes.rows.length === 0) {
             isProcessing = false;
             return;
         }
 
-        for (const pos of res.rows) {
+        for (const pos of positionsRes.rows) {
             const currentPrice = latestPrice[pos.pair];
             if (!currentPrice) continue;
 
@@ -193,14 +195,12 @@ async function checkLiquidations() {
             const remainingEquity = margin + pnl;
             const liquidationThreshold = closeCommission + maintenanceMargin;
 
-            // === ЛИКВИДАЦИЯ ===
             if (remainingEquity <= liquidationThreshold) {
                 console.log(`💀 LIQUIDATING: User ${pos.user_id} | ${pos.pair}`);
                 await executeLiquidation(pos, currentPrice);
                 continue;
             }
 
-            // === ПРЕДУПРЕЖДЕНИЕ ===
             const warningThreshold = liquidationThreshold * 1.2;
 
             if (!pos.warning_sent && remainingEquity <= warningThreshold) {
@@ -217,11 +217,169 @@ async function checkLiquidations() {
                 await db.query(`UPDATE positions SET warning_sent = TRUE WHERE id = $1`, [pos.id]);
                 console.log(`⚠️ Warning sent to user ${pos.user_id}`);
             }
+
+            await checkTpSlForPosition(pos, currentPrice);
         }
     } catch (e) {
-        console.error("Liquidation Loop Error:", e.message);
+        console.error("Liquidation/TP-SL Loop Error:", e.message);
     } finally {
         isProcessing = false;
+    }
+}
+
+async function checkTpSlForPosition(pos, currentPrice) {
+    try {
+        const ordersRes = await db.query(
+            "SELECT * FROM tp_sl_orders WHERE position_id = $1 AND status = 'ACTIVE' ORDER BY created_at ASC",
+            [pos.id]
+        );
+
+        if (ordersRes.rows.length === 0) return;
+
+        const entry = Number(pos.entry_price);
+
+        for (const order of ordersRes.rows) {
+            const triggerPrice = Number(order.trigger_price);
+            let shouldTrigger = false;
+
+            if (order.type === 'TAKE_PROFIT') {
+                if (pos.type === 'LONG' && currentPrice >= triggerPrice) {
+                    shouldTrigger = true;
+                } else if (pos.type === 'SHORT' && currentPrice <= triggerPrice) {
+                    shouldTrigger = true;
+                }
+            } else if (order.type === 'STOP_LOSS') {
+                if (pos.type === 'LONG' && currentPrice <= triggerPrice) {
+                    shouldTrigger = true;
+                } else if (pos.type === 'SHORT' && currentPrice >= triggerPrice) {
+                    shouldTrigger = true;
+                }
+            }
+
+            if (shouldTrigger) {
+                console.log(`🎯 ${order.type} TRIGGERED: Position ${pos.id} @ ${currentPrice}`);
+                await executeTpSlOrder(order, pos, currentPrice);
+            }
+        }
+    } catch (e) {
+        console.error(`Error checking TP/SL for position ${pos.id}:`, e.message);
+    }
+}
+
+async function executeTpSlOrder(order, pos, exitPrice) {
+    const client = await db.connect();
+    
+    try {
+        await client.query("BEGIN");
+
+        const freshOrder = await client.query(
+            "SELECT * FROM tp_sl_orders WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE",
+            [order.id]
+        );
+
+        if (!freshOrder.rows.length) {
+            await client.query("ROLLBACK");
+            return;
+        }
+
+        const freshPos = await client.query(
+            "SELECT * FROM positions WHERE id = $1 FOR UPDATE",
+            [pos.id]
+        );
+
+        if (!freshPos.rows.length) {
+            await client.query("UPDATE tp_sl_orders SET status = 'CANCELLED' WHERE id = $1", [order.id]);
+            await client.query("COMMIT");
+            return;
+        }
+
+        const position = freshPos.rows[0];
+        const sizePercent = Number(order.size_percent);
+        const positionSize = Number(position.size);
+        const positionMargin = Number(position.margin);
+        const entryPrice = Number(position.entry_price);
+
+        const closeSize = (positionSize * sizePercent) / 100;
+        const closeMargin = (positionMargin * sizePercent) / 100;
+
+        const priceChangePct = (exitPrice - entryPrice) / entryPrice;
+        let pnl = priceChangePct * closeSize;
+        if (position.type === "SHORT") pnl = -pnl;
+
+        const commission = closeSize * 0.0003;
+        let totalReturn = closeMargin + pnl - commission;
+
+        if (totalReturn < 0) totalReturn = 0;
+
+        if (totalReturn > 0) {
+            await client.query(
+                "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                [totalReturn, position.user_id]
+            );
+        }
+
+        await client.query(`
+            INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [position.user_id, position.pair, position.type, entryPrice, exitPrice, closeSize, position.leverage, pnl, commission]);
+
+        await client.query(
+            "UPDATE tp_sl_orders SET status = 'TRIGGERED', triggered_at = CURRENT_TIMESTAMP WHERE id = $1",
+            [order.id]
+        );
+
+        if (sizePercent >= 100) {
+            await client.query("DELETE FROM positions WHERE id = $1", [position.id]);
+            await client.query(
+                "UPDATE tp_sl_orders SET status = 'CANCELLED' WHERE position_id = $1 AND status = 'ACTIVE'",
+                [position.id]
+            );
+        } else {
+            const remainingSize = positionSize - closeSize;
+            const remainingMargin = positionMargin - closeMargin;
+
+            await client.query(
+                "UPDATE positions SET size = $1, margin = $2 WHERE id = $3",
+                [remainingSize, remainingMargin, position.id]
+            );
+
+            const remainingOrders = await client.query(
+                "SELECT id, size_percent, size_amount FROM tp_sl_orders WHERE position_id = $1 AND status = 'ACTIVE'",
+                [position.id]
+            );
+
+            for (const remainingOrder of remainingOrders.rows) {
+                const newSizeAmount = (remainingSize * Number(remainingOrder.size_percent)) / 100;
+                await client.query(
+                    "UPDATE tp_sl_orders SET size_amount = $1 WHERE id = $2",
+                    [newSizeAmount, remainingOrder.id]
+                );
+            }
+        }
+
+        await client.query("COMMIT");
+
+        const orderTypeLabel = order.type === 'TAKE_PROFIT' ? '🎯 Take Profit' : '🛑 Stop Loss';
+        const pnlSign = pnl >= 0 ? '+' : '';
+        
+        const msg = `${orderTypeLabel} <b>TRIGGERED</b>\n\n` +
+            `Position: <b>${position.type} ${position.pair}</b> x${position.leverage}\n` +
+            `Trigger Price: ${exitPrice.toFixed(2)}\n` +
+            `Closed: ${sizePercent}% (${closeSize.toFixed(2)} VP)\n` +
+            `📊 PnL: ${pnlSign}${pnl.toFixed(2)} VP\n` +
+            `💸 Fee: ${commission.toFixed(2)} VP\n` +
+            `💰 Returned: ${totalReturn.toFixed(2)} VP`;
+
+        sendTelegramAlert(position.user_id, msg);
+        broadcastTpSlTriggered(position.user_id, order.id, order.type, position.id, exitPrice, pnl, sizePercent);
+
+        console.log(`✅ ${order.type} executed for position ${position.id}: ${sizePercent}% @ ${exitPrice}, PnL: ${pnl.toFixed(2)}`);
+
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error(`❌ Error executing TP/SL order ${order.id}:`, e.message);
+    } finally {
+        client.release();
     }
 }
 
@@ -231,22 +389,24 @@ async function executeLiquidation(pos, exitPrice) {
         const size = Number(pos.size);
         const margin = Number(pos.margin);
 
-        // Комиссия закрытия (0.03% от notional/size)
         const closeCommission = size * 0.0003;
 
-        // Мы моделируем liquidation как: вся маржа сгорает (на баланс ничего не возвращаем).
-        // Чтобы история была консистентной с totalReturn=0:
-        // totalReturn = margin + pnl - commission = 0 => pnl = commission - margin
-        // pnl здесь — "gross" (без комиссии), а commission — отдельным полем.
         const pnlGross = closeCommission - margin;
 
         await client.query("BEGIN");
+
         await client.query(`
             INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `, [pos.user_id, pos.pair, pos.type, pos.entry_price, exitPrice, size, pos.leverage, pnlGross, closeCommission]);
 
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
+
+        await client.query(
+            "UPDATE tp_sl_orders SET status = 'CANCELLED' WHERE position_id = $1 AND status = 'ACTIVE'",
+            [pos.id]
+        );
+
         await client.query("COMMIT");
 
         const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
@@ -257,6 +417,14 @@ async function executeLiquidation(pos, exitPrice) {
 
         sendTelegramAlert(pos.user_id, msg);
 
+        broadcast({
+            type: "positionLiquidated",
+            userId: pos.user_id,
+            positionId: pos.id,
+            pair: pos.pair,
+            ts: Date.now()
+        });
+
     } catch (e) {
         await client.query("ROLLBACK");
         console.error("Liquidation DB Error:", e);
@@ -265,9 +433,8 @@ async function executeLiquidation(pos, exitPrice) {
     }
 }
 
-setInterval(checkLiquidations, 500);
+setInterval(checkLiquidationsAndTpSl, 500);
 
-// === 1. ЗАГРУЗКА ИСТОРИИ (COINBASE) ===
 async function fetchCoinbaseCandlesPage(product, granularity, endSec) {
     try {
         const end = new Date(endSec * 1000);
@@ -282,7 +449,6 @@ async function fetchCoinbaseCandlesPage(product, granularity, endSec) {
         if (!r.ok) return;
         const chunk = await r.json();
 
-        // Coinbase returns [ time, low, high, open, close, volume ]
         return chunk
             .map(c => ({
                 time: Math.floor(c[0]),
@@ -315,8 +481,6 @@ async function ensureHistoryLength(product, granularity = 60, minCandles = INITI
     ensureHistoryBucket(product, g);
 
     let arr = historyStore[product][g];
-    // Backfill older candles until we have enough for initial load
-    // Coinbase is paginated by time ranges; each call gives up to 300 candles.
     let safetyPages = 0;
     while (arr.length < minCandles && safetyPages < 20 && arr.length > 0) {
         safetyPages++;
@@ -327,7 +491,6 @@ async function ensureHistoryLength(product, granularity = 60, minCandles = INITI
         arr = mergeCandles(arr, page);
         historyStore[product][g] = arr;
 
-        // If we didn't extend the left edge, stop (prevents infinite loop on API quirks)
         if (arr[0].time >= oldest) break;
     }
 }
@@ -343,7 +506,6 @@ async function ensureHistoryBefore(product, granularity, untilSec) {
         if (arr.length === 0) return;
     }
 
-    // If the client requests older than our current oldest, backfill more pages.
     let safetyPages = 0;
     while (arr.length > 0 && arr[0].time >= untilSec && safetyPages < 20) {
         safetyPages++;
@@ -358,7 +520,6 @@ async function ensureHistoryBefore(product, granularity, untilSec) {
     }
 }
 
-// === 2. ПОДКЛЮЧЕНИЕ К BINANCE ===
 let binanceWS;
 
 function connectBinanceWS() {
@@ -421,7 +582,6 @@ setInterval(() => {
     });
 }, 200);
 
-// === 3. СЕРВЕР ДЛЯ КЛИЕНТОВ ===
 wss.on("connection", ws => {
     ws.subscriptions = new Set();
 
@@ -429,14 +589,11 @@ wss.on("connection", ws => {
         try {
             const data = JSON.parse(raw.toString());
 
-            // SUBSCRIBE / CHANGE TIMEFRAME
             if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
                 ws.subscriptions.add(data.pair);
-                const granularity = normalizeGranularity(data.timeframe || 60); // Default 1m
+                const granularity = normalizeGranularity(data.timeframe || 60);
 
-                // Send History
                 await withHistoryLock(data.pair, granularity, async () => {
-                    // Ensure we have enough candles for initial display
                     await ensureHistoryLength(data.pair, granularity, INITIAL_HISTORY_CANDLES);
                 });
 
@@ -457,10 +614,9 @@ wss.on("connection", ws => {
                 if (tradesStore[data.pair]) ws.send(JSON.stringify({ type: "trades", pair: data.pair, trades: tradesStore[data.pair].slice(-20) }));
             }
 
-            // LOAD MORE HISTORY (LAZY LOADING)
             if (data.type === "loadMore" && PRODUCTS.includes(data.pair)) {
                 const granularity = normalizeGranularity(data.timeframe || 60);
-                const oldestTime = data.until; // Timestamp of the leftmost visible candle
+                const oldestTime = data.until;
 
                 console.log(`📥 loadMore request: ${data.pair} @ ${granularity}s, before ${new Date(oldestTime * 1000).toISOString()}`);
 
@@ -477,7 +633,6 @@ wss.on("connection", ws => {
 
                 console.log(`📤 Found ${chunk.length} older candles to send back`);
 
-                // ALWAYS send response (even if empty) so client knows to stop waiting
                 ws.send(JSON.stringify({
                     type: "moreHistory",
                     pair: data.pair,
@@ -490,24 +645,17 @@ wss.on("connection", ws => {
     });
 });
 
-// === 🛡️ СИСТЕМА ANTI-SLEEP ===
 const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com";
 
-// 1. Пингуем другой сервер
 cron.schedule("*/10 * * * *", async () => {
-    // console.log("⏰ Anti-Sleep: Pinging Main Server...");
     try {
         await fetch(`${MAIN_SERVER_URL}/api/health`);
     } catch (e) { }
 });
 
-// === 🔄 АВТО-ОБНОВЛЕНИЕ ИСТОРИИ (НОВОЕ!) ===
-// Обновляем массив истории свечей каждую минуту
 cron.schedule("*/1 * * * *", async () => {
-    // console.log("🔄 Updating Candle History...");
     for (const p of PRODUCTS) {
         for (const tf of TIMEFRAMES) {
-            // Refresh only the latest page, while keeping already backfilled older candles
             await withHistoryLock(p, tf, async () => {
                 await refreshLatestHistory(p, tf);
             });
