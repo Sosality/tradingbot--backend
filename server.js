@@ -614,13 +614,26 @@ function connectBinanceWS() {
     });
 }
 
+// Broadcast orderbook every 200ms (more frequent)
 setInterval(() => {
     PRODUCTS.forEach(pair => {
         if (orderbookStore[pair]) {
-            broadcast({ type: "orderBook", pair, ...orderbookStore[pair], ts: Date.now() });
+            broadcast({ type: "orderBook", pair, buy: orderbookStore[pair].buy || [], sell: orderbookStore[pair].sell || [], ts: Date.now() });
         }
     });
 }, 200);
+
+// Also refresh orderbook periodically even if no updates
+setInterval(() => {
+    PRODUCTS.forEach(pair => {
+        if (!orderbookStore[pair]) return;
+        const buy = orderbookStore[pair].buy || [];
+        const sell = orderbookStore[pair].sell || [];
+        if (buy.length > 0 && sell.length > 0) {
+            broadcast({ type: "orderBook", pair, buy, sell, ts: Date.now() });
+        }
+    });
+}, 300);
 
 // ======================== CLIENT WEBSOCKET ========================
 
