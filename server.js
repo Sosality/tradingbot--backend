@@ -32,6 +32,10 @@ const COINBASE_MAX_CANDLES_PER_REQUEST = 300;
 const INITIAL_HISTORY_CANDLES = 1400;
 const MAX_CACHED_CANDLES = 20000;
 
+const MIN_PARTIAL_PERCENT = 10;
+const MAX_TP_PER_POSITION = 3;
+const MAX_SL_PER_POSITION = 3;
+
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 const historyStore = {};
@@ -46,7 +50,43 @@ const db = new Pool({
     ssl: true
 });
 
-db.connect().then(() => console.log("✅ Liquidation & TP/SL Engine Connected")).catch(e => console.error("DB Error:", e.message));
+async function initDatabase() {
+    try {
+        await db.connect();
+        console.log("✅ Database Connected");
+
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS tp_sl_orders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                position_id INTEGER NOT NULL,
+                pair VARCHAR(20) NOT NULL,
+                order_type VARCHAR(10) NOT NULL CHECK (order_type IN ('TP', 'SL')),
+                trigger_price DECIMAL(20, 8) NOT NULL,
+                size_percent DECIMAL(5, 2) NOT NULL DEFAULT 100,
+                status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'TRIGGERED', 'CANCELLED')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                triggered_at TIMESTAMP
+            )
+        `);
+
+        await db.query(`
+            CREATE INDEX IF NOT EXISTS idx_tpsl_position ON tp_sl_orders(position_id)
+        `);
+        await db.query(`
+            CREATE INDEX IF NOT EXISTS idx_tpsl_status ON tp_sl_orders(status)
+        `);
+        await db.query(`
+            CREATE INDEX IF NOT EXISTS idx_tpsl_user ON tp_sl_orders(user_id)
+        `);
+
+        console.log("✅ TP/SL Orders table ready");
+    } catch (e) {
+        console.error("DB Init Error:", e.message);
+    }
+}
+
+initDatabase();
 
 function getBinanceSymbol(product) {
     return product.replace("-", "").toLowerCase() + "t";
@@ -55,6 +95,11 @@ function getBinanceSymbol(product) {
 function normalizeGranularity(granularity) {
     const g = Number(granularity);
     return TIMEFRAMES.includes(g) ? g : 60;
+}
+
+function normalizePair(p) {
+    if (!p) return "";
+    return String(p).trim().replace("/", "-").toUpperCase();
 }
 
 function ensureHistoryBucket(product, granularity) {
@@ -146,6 +191,209 @@ async function sendTelegramAlert(userId, message) {
 let isProcessingLiquidations = false;
 let isProcessingTpSl = false;
 
+// ======================== TP/SL API ENDPOINTS ========================
+
+app.post("/api/tp-sl/create", async (req, res) => {
+    const { userId, positionId, orderType, triggerPrice, sizePercent } = req.body;
+
+    if (!userId || !positionId || !orderType || !triggerPrice) {
+        return res.json({ ok: false, error: "Missing required fields" });
+    }
+
+    if (!['TP', 'SL'].includes(orderType)) {
+        return res.json({ ok: false, error: "Invalid order type" });
+    }
+
+    const trigger = Number(triggerPrice);
+    const sizePct = Number(sizePercent) || 100;
+
+    if (trigger <= 0) {
+        return res.json({ ok: false, error: "Invalid trigger price" });
+    }
+
+    if (sizePct < MIN_PARTIAL_PERCENT || sizePct > 100) {
+        return res.json({ ok: false, error: `Size must be between ${MIN_PARTIAL_PERCENT}% and 100%` });
+    }
+
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+
+        const posRes = await client.query(
+            "SELECT * FROM positions WHERE id = $1 AND user_id = $2",
+            [positionId, userId]
+        );
+
+        if (!posRes.rows.length) {
+            await client.query("ROLLBACK");
+            return res.json({ ok: false, error: "Position not found" });
+        }
+
+        const position = posRes.rows[0];
+        const pair = normalizePair(position.pair);
+        const posType = position.type.toUpperCase();
+        const currentPrice = latestPrice[pair];
+
+        if (currentPrice) {
+            if (orderType === 'TP') {
+                if (posType === 'LONG' && trigger <= currentPrice) {
+                    await client.query("ROLLBACK");
+                    return res.json({ ok: false, error: "TP must be above current price for LONG" });
+                }
+                if (posType === 'SHORT' && trigger >= currentPrice) {
+                    await client.query("ROLLBACK");
+                    return res.json({ ok: false, error: "TP must be below current price for SHORT" });
+                }
+            } else {
+                if (posType === 'LONG' && trigger >= currentPrice) {
+                    await client.query("ROLLBACK");
+                    return res.json({ ok: false, error: "SL must be below current price for LONG" });
+                }
+                if (posType === 'SHORT' && trigger <= currentPrice) {
+                    await client.query("ROLLBACK");
+                    return res.json({ ok: false, error: "SL must be above current price for SHORT" });
+                }
+            }
+        }
+
+        const existingOrders = await client.query(
+            "SELECT * FROM tp_sl_orders WHERE position_id = $1 AND status = 'ACTIVE'",
+            [positionId]
+        );
+
+        const sameTypeOrders = existingOrders.rows.filter(o => o.order_type === orderType);
+        const maxOrders = orderType === 'TP' ? MAX_TP_PER_POSITION : MAX_SL_PER_POSITION;
+
+        if (sameTypeOrders.length >= maxOrders) {
+            await client.query("ROLLBACK");
+            return res.json({ ok: false, error: `Maximum ${maxOrders} ${orderType} orders reached` });
+        }
+
+        const usedPercent = sameTypeOrders.reduce((sum, o) => sum + Number(o.size_percent), 0);
+        const availablePercent = 100 - usedPercent;
+
+        if (sizePct > availablePercent) {
+            await client.query("ROLLBACK");
+            return res.json({ 
+                ok: false, 
+                error: "EXCEEDS_AVAILABLE_VOLUME",
+                availablePercent: Math.floor(availablePercent)
+            });
+        }
+
+        const insertRes = await client.query(`
+            INSERT INTO tp_sl_orders (user_id, position_id, pair, order_type, trigger_price, size_percent, status)
+            VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE')
+            RETURNING *
+        `, [userId, positionId, pair, orderType, trigger, sizePct]);
+
+        const newOrder = insertRes.rows[0];
+
+        const allOrdersRes = await client.query(
+            "SELECT * FROM tp_sl_orders WHERE position_id = $1 AND status = 'ACTIVE' ORDER BY created_at ASC",
+            [positionId]
+        );
+
+        await client.query("COMMIT");
+
+        console.log(`✅ ${orderType} order created: Position ${positionId}, Price ${trigger}, Size ${sizePct}%`);
+
+        res.json({
+            ok: true,
+            order: newOrder,
+            allOrders: allOrdersRes.rows
+        });
+
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("TP/SL Create Error:", e.message);
+        res.json({ ok: false, error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.post("/api/tp-sl/delete", async (req, res) => {
+    const { userId, orderId } = req.body;
+
+    if (!userId || !orderId) {
+        return res.json({ ok: false, error: "Missing required fields" });
+    }
+
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+
+        const orderRes = await client.query(
+            "SELECT * FROM tp_sl_orders WHERE id = $1 AND user_id = $2 AND status = 'ACTIVE'",
+            [orderId, userId]
+        );
+
+        if (!orderRes.rows.length) {
+            await client.query("ROLLBACK");
+            return res.json({ ok: false, error: "Order not found or already processed" });
+        }
+
+        const order = orderRes.rows[0];
+        const positionId = order.position_id;
+
+        await client.query(
+            "UPDATE tp_sl_orders SET status = 'CANCELLED' WHERE id = $1",
+            [orderId]
+        );
+
+        const allOrdersRes = await client.query(
+            "SELECT * FROM tp_sl_orders WHERE position_id = $1 AND status = 'ACTIVE' ORDER BY created_at ASC",
+            [positionId]
+        );
+
+        await client.query("COMMIT");
+
+        console.log(`✅ TP/SL order ${orderId} cancelled`);
+
+        res.json({
+            ok: true,
+            allOrders: allOrdersRes.rows
+        });
+
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("TP/SL Delete Error:", e.message);
+        res.json({ ok: false, error: "Database error" });
+    } finally {
+        client.release();
+    }
+});
+
+app.get("/api/tp-sl/list", async (req, res) => {
+    const { userId, positionId } = req.query;
+
+    if (!userId) {
+        return res.json({ ok: false, error: "Missing userId" });
+    }
+
+    try {
+        let query = "SELECT * FROM tp_sl_orders WHERE user_id = $1 AND status = 'ACTIVE' ORDER BY created_at ASC";
+        let params = [userId];
+
+        if (positionId) {
+            query = "SELECT * FROM tp_sl_orders WHERE user_id = $1 AND position_id = $2 AND status = 'ACTIVE' ORDER BY created_at ASC";
+            params = [userId, positionId];
+        }
+
+        const result = await db.query(query, params);
+
+        res.json({
+            ok: true,
+            orders: result.rows
+        });
+
+    } catch (e) {
+        console.error("TP/SL List Error:", e.message);
+        res.json({ ok: false, error: "Database error" });
+    }
+});
+
 // ======================== LIQUIDATION ENGINE ========================
 
 async function checkLiquidations() {
@@ -162,7 +410,8 @@ async function checkLiquidations() {
         }
 
         for (const pos of res.rows) {
-            const currentPrice = latestPrice[pos.pair];
+            const pair = normalizePair(pos.pair);
+            const currentPrice = latestPrice[pair];
             if (!currentPrice) continue;
 
             const entry = Number(pos.entry_price);
@@ -223,6 +472,12 @@ async function executeLiquidation(pos, exitPrice) {
         const pnlGross = closeCommission - margin;
 
         await client.query("BEGIN");
+
+        await client.query(
+            "UPDATE tp_sl_orders SET status = 'CANCELLED' WHERE position_id = $1 AND status = 'ACTIVE'",
+            [pos.id]
+        );
+
         await client.query(`
             INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -267,7 +522,8 @@ async function checkTpSlOrders() {
         const positionCache = new Map();
 
         for (const order of ordersRes.rows) {
-            const currentPrice = latestPrice[order.pair];
+            const pair = normalizePair(order.pair);
+            const currentPrice = latestPrice[pair];
             if (!currentPrice) continue;
 
             let pos = positionCache.get(Number(order.position_id));
@@ -388,19 +644,12 @@ async function executeTpSlOrder(order, pos, executionPrice) {
             for (const remainingOrder of remainingOrders.rows) {
                 const orderSizeAbs = (posSize * Number(remainingOrder.size_percent)) / 100;
                 if (orderSizeAbs > remainingSize) {
-                    const newPercent = Math.min(100, (orderSizeAbs / remainingSize) * 100);
-                    if (newPercent > 100) {
-                        const cappedPercent = 100;
-                        await client.query(
-                            "UPDATE tp_sl_orders SET size_percent = $1 WHERE id = $2",
-                            [cappedPercent, remainingOrder.id]
-                        );
-                    } else {
-                        await client.query(
-                            "UPDATE tp_sl_orders SET size_percent = $1 WHERE id = $2",
-                            [Math.round(newPercent * 100) / 100, remainingOrder.id]
-                        );
-                    }
+                    const newPercent = Math.min(100, (remainingSize / posSize) * Number(remainingOrder.size_percent) * (posSize / remainingSize));
+                    const cappedPercent = Math.min(100, Math.max(MIN_PARTIAL_PERCENT, newPercent));
+                    await client.query(
+                        "UPDATE tp_sl_orders SET size_percent = $1 WHERE id = $2",
+                        [Math.round(cappedPercent * 100) / 100, remainingOrder.id]
+                    );
                 }
             }
 
@@ -418,7 +667,7 @@ async function executeTpSlOrder(order, pos, executionPrice) {
                 for (const o of sameTypeOrders) {
                     const updatedRes = await client.query("SELECT size_percent FROM tp_sl_orders WHERE id = $1", [o.id]);
                     if (updatedRes.rows.length) {
-                        const newPct = Math.max(MIN_PARTIAL_PERCENT_CONST, Number(updatedRes.rows[0].size_percent) * scale);
+                        const newPct = Math.max(MIN_PARTIAL_PERCENT, Number(updatedRes.rows[0].size_percent) * scale);
                         await client.query(
                             "UPDATE tp_sl_orders SET size_percent = $1 WHERE id = $2",
                             [Math.round(newPct * 100) / 100, o.id]
@@ -465,8 +714,6 @@ async function executeTpSlOrder(order, pos, executionPrice) {
         client.release();
     }
 }
-
-const MIN_PARTIAL_PERCENT_CONST = 10;
 
 setInterval(checkLiquidations, 500);
 setInterval(checkTpSlOrders, 500);
