@@ -23,7 +23,7 @@ const wss = new WebSocketServer({ server });
 const PRODUCTS = ["BTC-USD", "ETH-USD"];
 const COINBASE_REST = "https://api.exchange.coinbase.com";
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
-const PROXY_URL = "http://g4alts:nT6UVMhowL@45.153.162.250:59100";
+const PROXY_URL = "http://admin0IA2s:dyLHVHsepX@185.13.225.210:59100";
 const DATABASE_URL = "postgresql://neondb_owner:npg_igxGcyUQmX52@ep-ancient-sky-a9db2z9z-pooler.gwc.azure.neon.tech/neondb?sslmode=require&channel_binding=require";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TIMEFRAMES = [60, 300, 900, 3600, 21600, 86400];
