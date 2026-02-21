@@ -8,6 +8,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { Pool } from "pg";
 import cron from "node-cron";
+import fs from 'fs';
 
 const app = express();
 app.use(cors());
@@ -49,7 +50,10 @@ const userWebSockets = new Map();
 
 const db = new Pool({
     connectionString: DATABASE_URL,
-    ssl: true
+    ssl: {
+        ca: fs.readFileSync('./certs/aiven-ca.pem').toString(),
+        rejectUnauthorized: true
+    }
 });
 
 async function initDatabase() {
