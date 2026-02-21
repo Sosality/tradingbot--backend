@@ -51,8 +51,7 @@ const userWebSockets = new Map();
 const db = new Pool({
     connectionString: DATABASE_URL,
     ssl: {
-        ca: fs.readFileSync('./certs/aiven-ca.pem').toString(),
-        rejectUnauthorized: true
+        rejectUnauthorized: false
     }
 });
 
