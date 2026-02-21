@@ -8,7 +8,6 @@ import WebSocket, { WebSocketServer } from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { Pool } from "pg";
 import cron from "node-cron";
-import fs from 'fs';
 
 const app = express();
 app.use(cors());
