@@ -45,6 +45,8 @@ const latestPrice = {};
 
 const historyLocks = new Map();
 
+const userWebSockets = new Map();
+
 const db = new Pool({
     connectionString: DATABASE_URL,
     ssl: true
@@ -87,6 +89,83 @@ async function initDatabase() {
 }
 
 initDatabase();
+
+function registerUserWebSocket(userId, ws) {
+    if (!userId) return;
+    const id = String(userId);
+    if (!userWebSockets.has(id)) {
+        userWebSockets.set(id, new Set());
+    }
+    userWebSockets.get(id).add(ws);
+    ws.userId = id;
+    console.log(`📱 User ${id} connected via WebSocket`);
+}
+
+function unregisterUserWebSocket(ws) {
+    if (ws.userId && userWebSockets.has(ws.userId)) {
+        userWebSockets.get(ws.userId).delete(ws);
+        if (userWebSockets.get(ws.userId).size === 0) {
+            userWebSockets.delete(ws.userId);
+        }
+        console.log(`📴 User ${ws.userId} disconnected from WebSocket`);
+    }
+}
+
+function sendToUser(userId, message) {
+    const id = String(userId);
+    const sockets = userWebSockets.get(id);
+    if (!sockets || sockets.size === 0) return;
+    
+    const text = JSON.stringify(message);
+    for (const ws of sockets) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(text);
+        }
+    }
+}
+
+async function fetchUserPositionsAndOrders(userId) {
+    const positionsRes = await db.query(
+        "SELECT * FROM positions WHERE user_id = $1",
+        [userId]
+    );
+    
+    const ordersRes = await db.query(
+        "SELECT * FROM tp_sl_orders WHERE user_id = $1 AND status = 'ACTIVE' ORDER BY created_at ASC",
+        [userId]
+    );
+    
+    const balanceRes = await db.query(
+        "SELECT balance FROM users WHERE user_id = $1",
+        [userId]
+    );
+    
+    return {
+        positions: positionsRes.rows,
+        tpSlOrders: ordersRes.rows,
+        balance: balanceRes.rows[0]?.balance || 0
+    };
+}
+
+async function notifyUserPositionUpdate(userId, eventType, details = {}) {
+    try {
+        const data = await fetchUserPositionsAndOrders(userId);
+        
+        sendToUser(userId, {
+            type: "positionUpdate",
+            eventType: eventType,
+            positions: data.positions,
+            tpSlOrders: data.tpSlOrders,
+            balance: Number(data.balance),
+            details: details,
+            timestamp: Date.now()
+        });
+        
+        console.log(`📤 Sent positionUpdate to user ${userId}: ${eventType}`);
+    } catch (e) {
+        console.error(`Failed to notify user ${userId}:`, e.message);
+    }
+}
 
 function getBinanceSymbol(product) {
     return product.replace("-", "").toLowerCase() + "t";
@@ -190,8 +269,6 @@ async function sendTelegramAlert(userId, message) {
 
 let isProcessingLiquidations = false;
 let isProcessingTpSl = false;
-
-// ======================== TP/SL API ENDPOINTS ========================
 
 app.post("/api/tp-sl/create", async (req, res) => {
     const { userId, positionId, orderType, triggerPrice, sizePercent } = req.body;
@@ -394,8 +471,6 @@ app.get("/api/tp-sl/list", async (req, res) => {
     }
 });
 
-// ======================== LIQUIDATION ENGINE ========================
-
 async function checkLiquidations() {
     if (isProcessingLiquidations || Object.keys(latestPrice).length === 0) return;
 
@@ -494,6 +569,14 @@ async function executeLiquidation(pos, exitPrice) {
 
         sendTelegramAlert(pos.user_id, msg);
 
+        await notifyUserPositionUpdate(pos.user_id, 'LIQUIDATION', {
+            positionId: pos.id,
+            pair: pos.pair,
+            type: pos.type,
+            pnl: pnlGross,
+            exitPrice: exitPrice
+        });
+
     } catch (e) {
         await client.query("ROLLBACK");
         console.error("Liquidation DB Error:", e);
@@ -501,8 +584,6 @@ async function executeLiquidation(pos, exitPrice) {
         client.release();
     }
 }
-
-// ======================== TP/SL ENGINE ========================
 
 async function checkTpSlOrders() {
     if (isProcessingTpSl || Object.keys(latestPrice).length === 0) return;
@@ -624,12 +705,15 @@ async function executeTpSlOrder(order, pos, executionPrice) {
         const remainingSize = posSize - closeSize;
         const remainingMargin = posMargin - closeMargin;
 
+        let positionClosed = false;
+
         if (isFullClose || remainingSize < 0.01 || remainingMargin < 0.01) {
             await client.query(
                 "UPDATE tp_sl_orders SET status = 'CANCELLED' WHERE position_id = $1 AND status = 'ACTIVE'",
                 [position.id]
             );
             await client.query("DELETE FROM positions WHERE id = $1", [position.id]);
+            positionClosed = true;
         } else {
             await client.query(
                 "UPDATE positions SET size = $1, margin = $2 WHERE id = $3",
@@ -685,7 +769,7 @@ async function executeTpSlOrder(order, pos, executionPrice) {
         const typeLabel = order.order_type === 'TP' ? 'Take Profit' : 'Stop Loss';
 
         let msg;
-        if (isFullClose || remainingSize < 0.01) {
+        if (positionClosed) {
             msg = `${emoji} <b>${typeLabel} Triggered!</b>\n\n` +
                 `Position <b>${posType} ${position.pair}</b> (x${position.leverage}) fully closed.\n\n` +
                 `📊 Entry: ${entryPrice}\n` +
@@ -705,6 +789,20 @@ async function executeTpSlOrder(order, pos, executionPrice) {
 
         sendTelegramAlert(position.user_id, msg);
 
+        await notifyUserPositionUpdate(position.user_id, positionClosed ? 'TP_SL_FULL_CLOSE' : 'TP_SL_PARTIAL_CLOSE', {
+            orderId: order.id,
+            orderType: order.order_type,
+            positionId: position.id,
+            pair: position.pair,
+            type: posType,
+            pnl: pnl,
+            sizePercent: sizePercent,
+            executionPrice: executionPrice,
+            positionClosed: positionClosed,
+            remainingSize: positionClosed ? 0 : remainingSize,
+            remainingMargin: positionClosed ? 0 : remainingMargin
+        });
+
         console.log(`✅ ${order.order_type} executed: Position ${position.id}, PnL: ${pnlFormatted}, Size: ${sizePercent}%`);
 
     } catch (e) {
@@ -717,8 +815,6 @@ async function executeTpSlOrder(order, pos, executionPrice) {
 
 setInterval(checkLiquidations, 500);
 setInterval(checkTpSlOrders, 500);
-
-// ======================== COINBASE HISTORY ========================
 
 async function fetchCoinbaseCandlesPage(product, granularity, endSec) {
     try {
@@ -805,8 +901,6 @@ async function ensureHistoryBefore(product, granularity, untilSec) {
     }
 }
 
-// ======================== BINANCE WEBSOCKET ========================
-
 let binanceWS;
 
 function connectBinanceWS() {
@@ -869,14 +963,19 @@ setInterval(() => {
     });
 }, 200);
 
-// ======================== CLIENT WEBSOCKET ========================
-
 wss.on("connection", ws => {
     ws.subscriptions = new Set();
+    ws.userId = null;
 
     ws.on("message", async raw => {
         try {
             const data = JSON.parse(raw.toString());
+
+            if (data.type === "auth" && data.userId) {
+                registerUserWebSocket(data.userId, ws);
+                ws.send(JSON.stringify({ type: "authOk", userId: data.userId }));
+                return;
+            }
 
             if (data.type === "subscribe" && PRODUCTS.includes(data.pair)) {
                 ws.subscriptions.add(data.pair);
@@ -932,9 +1031,15 @@ wss.on("connection", ws => {
 
         } catch (e) { console.error(e); }
     });
-});
 
-// ======================== ANTI-SLEEP & CRON ========================
+    ws.on("close", () => {
+        unregisterUserWebSocket(ws);
+    });
+
+    ws.on("error", () => {
+        unregisterUserWebSocket(ws);
+    });
+});
 
 const MAIN_SERVER_URL = "https://tradingbot-p9n8.onrender.com";
 
