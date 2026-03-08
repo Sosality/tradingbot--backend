@@ -26,6 +26,8 @@ const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 const PROXY_URL = "http://s4ckyrylor:HkuQGepJBd@185.13.225.203:59100";
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const VAULT_FRACTION = 0.5;              // 50% P&L идёт из пула
+const MAX_VAULT_DRAIN_PER_TRADE = 0.1;   // Макс 10% пула за сделку
 const TIMEFRAMES = [60, 300, 900, 3600, 21600, 86400];
 
 const COINBASE_MAX_CANDLES_PER_REQUEST = 300;
@@ -91,6 +93,64 @@ async function initDatabase() {
 }
 
 initDatabase();
+
+// ======================== VAULT FUNCTIONS ========================
+
+async function getVaultPool() {
+  try {
+    const res = await db.query("SELECT * FROM vault_pool LIMIT 1");
+    return res.rows[0] || {
+      total_balance: 0,
+      total_locked_balance: 0,
+      total_unlocked_balance: 0,
+      cumulative_pnl: 0
+    };
+  } catch (e) {
+    console.error("Error getting vault pool:", e.message);
+    return { total_balance: 0 };
+  }
+}
+
+async function applyTraderPnlToVault(client, traderPnl, reason, traderId, positionId) {
+  try {
+    const pool = await getVaultPool();
+    const poolBalance = Number(pool.total_balance);
+    
+    if (poolBalance <= 0) return 0;
+    
+    let vaultDelta = -traderPnl * VAULT_FRACTION;
+    
+    if (Math.abs(vaultDelta) > poolBalance * MAX_VAULT_DRAIN_PER_TRADE) {
+      vaultDelta = vaultDelta > 0 
+        ? poolBalance * MAX_VAULT_DRAIN_PER_TRADE 
+        : -poolBalance * MAX_VAULT_DRAIN_PER_TRADE;
+    }
+    
+    const newBalance = Math.max(0, poolBalance + vaultDelta);
+    const scaleFactor = newBalance > 0 ? newBalance / poolBalance : 0;
+    
+    await client.query(`
+      UPDATE vault_pool SET
+        total_balance = $1,
+        total_locked_balance = total_locked_balance * $2,
+        total_unlocked_balance = total_unlocked_balance * $2,
+        cumulative_pnl = cumulative_pnl + $3,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+    `, [newBalance, scaleFactor, vaultDelta]);
+
+    await client.query(`
+      INSERT INTO vault_pnl_history 
+        (delta, reason, trader_user_id, position_id, fraction_applied, pool_balance_before, pool_balance_after)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, [vaultDelta, reason, traderId, positionId, VAULT_FRACTION, poolBalance, newBalance]);
+
+    return vaultDelta;
+  } catch (e) {
+    console.error("Error applying vault PnL:", e.message);
+    return 0;
+  }
+}
 
 function registerUserWebSocket(userId, ws) {
     if (!userId) return;
@@ -555,6 +615,15 @@ async function executeLiquidation(pos, exitPrice) {
             [pos.id]
         );
 
+        // Применяем P&L к пулу
+        const vaultDelta = await applyTraderPnlToVault(
+            client,
+            pnlGross,
+            'liquidation',
+            pos.user_id,
+            pos.id
+        );
+
         await client.query(`
             INSERT INTO trades_history (user_id, pair, type, entry_price, exit_price, size, leverage, pnl, commission)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -562,6 +631,8 @@ async function executeLiquidation(pos, exitPrice) {
 
         await client.query(`DELETE FROM positions WHERE id = $1`, [pos.id]);
         await client.query("COMMIT");
+
+        console.log(`💀 Liquidation: vault_delta=${vaultDelta.toFixed(2)}`);
 
         const msg = `⛔️ <b>LIQUIDATED</b>\n\n` +
             `Your position <b>${pos.pair}</b> has been forcefully closed.\n` +
@@ -685,6 +756,15 @@ async function executeTpSlOrder(order, pos, executionPrice) {
         let totalReturn = closeMargin + pnl - commission;
 
         if (totalReturn < 0) totalReturn = 0;
+
+        // Применяем P&L к пулу
+        const vaultDelta = await applyTraderPnlToVault(
+            client,
+            pnl,
+            'tp_sl_execution',
+            position.user_id,
+            position.id
+        );
 
         if (totalReturn > 0) {
             await client.query(
